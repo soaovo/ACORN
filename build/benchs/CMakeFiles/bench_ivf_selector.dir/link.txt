@@ -1,0 +1,1 @@
+/opt/rh/devtoolset-9/root/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/bench_ivf_selector.dir/bench_ivf_selector.cpp.o -o bench_ivf_selector  -Wl,-rpath,/home/cxy/ACORN/ACORN/build/faiss ../faiss/libfaiss.so /usr/lib64/libz.so 

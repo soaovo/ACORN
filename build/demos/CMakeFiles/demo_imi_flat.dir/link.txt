@@ -1,0 +1,1 @@
+/opt/rh/devtoolset-9/root/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/demo_imi_flat.dir/demo_imi_flat.cpp.o -o demo_imi_flat  -Wl,-rpath,/home/cxy/ACORN/ACORN/build/faiss ../faiss/libfaiss.so /usr/lib64/libz.so 
