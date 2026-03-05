@@ -17,6 +17,8 @@
 #include <unistd.h>
 
 
+
+
 // added these
 #include <faiss/Index.h>
 #include <stdlib.h>
@@ -39,6 +41,25 @@
 #include <numeric> // for std::accumulate
 #include <cmath>   // for std::mean and std::stdev
 #include <nlohmann/json.hpp>
+
+#include <stdexcept>
+
+static const std::string CUSTOM_BASE = "/SSD/SIFT1M/sift_base.fvecs";
+static const std::string CUSTOM_QUERY = "/SSD/SIFT1M/sift_query.fvecs";
+static const std::string CUSTOM_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata.txt";
+static const std::string CUSTOM_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta.txt";
+static const std::string CUSTOM_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth.ivecs";
+
+std::vector<int> load_ints_from_txt(const std::string& path) {
+    std::ifstream fin(path);
+    if (!fin.is_open()) throw std::runtime_error("Cannot open " + path);
+    std::vector<int> vals;
+    int x;
+    while (fin >> x) vals.push_back(x);
+    return vals;
+}
+
+
 // #include <format>
 // for convenience
 using json = nlohmann::json;
@@ -120,7 +141,9 @@ int* ivecs_read(const char* fname, size_t* d_out, size_t* n_out) {
 
 // get file name to load data vectors from
 std::string get_file_name(std::string dataset, bool is_base) {
-    if (dataset == "sift1M" || dataset == "sift1M_test") {
+    if (dataset == "custom") {
+    return is_base ? CUSTOM_BASE : CUSTOM_QUERY;
+} else if (dataset == "sift1M" || dataset == "sift1M_test") {
         return std::string("./Datasets/sift1M/sift_") + (is_base ? "base" : "query") + ".fvecs";
     } else if (dataset == "sift1B") {
         return std::string("./Datasets/sift1B/bigann_") + (is_base ? "base_10m" : "query") + ".fvecs";
@@ -309,7 +332,11 @@ std::vector<T> load_json_to_vector(std::string filepath) {
 
 
 std::vector<int> load_aq(std::string dataset, int n_centroids, int alpha, int N) {
-    if (dataset == "sift1M" || dataset == "sift1B") {
+    if (dataset == "custom") {
+    return load_ints_from_txt(CUSTOM_QUERY_META);
+}
+
+    else if (dataset == "sift1M" || dataset == "sift1B") {
         assert((alpha == -2 || alpha == 0 || alpha == 2) || !"alpha must be value in [-2, 0, 2]");
 
         // Compose File Name
@@ -376,7 +403,13 @@ std::vector<int> load_aq(std::string dataset, int n_centroids, int alpha, int N)
 // assignment_type can be "rand", "soft", "soft_squared", "hard"
 std::vector<int> load_ab(std::string dataset, int n_centroids, std::string assignment_type, int N) {
     // Compose File Name
-    if (dataset == "sift1M" || dataset == "sift1B") {
+    if (dataset == "custom") {
+        auto vals = load_ints_from_txt(CUSTOM_BASE_META);
+        if ((int)vals.size() > N) vals.resize(N);
+        return vals;
+    }
+
+    else if (dataset == "sift1M" || dataset == "sift1B") {
         std::stringstream filepath_stream;   
         filepath_stream << TESTING_DATA_DIR << "/base_attrs_sift" <<   (int) (N / 1000 / 1000)   << "m_nc=" << n_centroids << "_assignment=" << assignment_type << ".json";
         std::string filepath = filepath_stream.str();
@@ -451,7 +484,15 @@ std::vector<int> load_ab(std::string dataset, int n_centroids, std::string assig
 // assignment_type can be "rand", "soft", "soft_squared", "hard"
 // alpha can be -2, 0, 2
 std::vector<faiss::idx_t> load_gt(std::string dataset, int n_centroids, int alpha, std::string assignment_type, int N) {
-    if (dataset == "sift1M" || dataset == "sift1B") {
+    if (dataset == "custom") {
+    size_t d, nq;
+    int* data = ivecs_read(CUSTOM_GT.c_str(), &d, &nq);
+    std::vector<faiss::idx_t> gt(data, data + d * nq);
+    delete[] data;
+    return gt;
+}
+
+    else if (dataset == "sift1M" || dataset == "sift1B") {
         // Compose File Name
         std::stringstream filepath_stream;
         filepath_stream << TESTING_DATA_DIR << "/gt_sift" << (int) (N / 1000 / 1000) << "m_nc=" << n_centroids << "_assignment=" << assignment_type << "_alpha=" << alpha << ".json";
