@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse, pathlib, numpy as np, faiss, h5py
+from faiss.contrib.datasets import fvecs_read   # 新增
 
 def load_fvecs(path):
-    return faiss.read_fvecs(str(path))
+    return fvecs_read(str(path))                # 替换调用
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--base", type=pathlib.Path, required=True)
