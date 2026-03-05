@@ -95,7 +95,7 @@ int main(int argc, char *argv[]) {
         
         dataset = argv[3];
         printf("dataset: %s\n", dataset.c_str());
-        if (dataset != "sift1M" && dataset != "sift1M_test" && dataset != "sift1B" && dataset != "tripclick" && dataset != "paper" && dataset != "paper_rand2m") {
+        if (dataset != "sift1M" && dataset != "sift1M_test" && dataset != "sift1B" && dataset != "tripclick" && dataset != "paper" && dataset != "paper_rand2m" && dataset != "custom") {
             printf("got dataset: %s\n", dataset.c_str());
             fprintf(stderr, "Invalid <dataset>; must be a value in [sift1M, sift1B]\n");
             exit(1);
