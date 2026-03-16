@@ -9,6 +9,7 @@
 
 #include <faiss/impl/ACORN.h>
 
+#include <algorithm>
 #include <string>
 
 #include <faiss/impl/AuxIndexStructures.h>
@@ -126,6 +127,7 @@ ACORN::ACORN(int M, int gamma, std::vector<int>& metadata, int M_beta) : rng(123
     max_level = -1;
     entry_point = -1;
     efSearch = 16;
+    pathwise_width = 1;
     efConstruction = M * gamma; //added gamma
     upper_beam = 1;
     this->gamma = gamma;
@@ -1117,6 +1119,8 @@ int search_from_candidates(
     bool do_dis_check = params ? params->check_relative_distance
                                : hnsw.check_relative_distance;
     int efSearch = params ? params->efSearch : hnsw.efSearch;
+    int pathwise_width = params ? std::max(1, params->pathwise_width)
+                                : std::max(1, hnsw.pathwise_width);
     const IDSelector* sel = params ? params->sel : nullptr;
 
     for (int i = 0; i < candidates.size(); i++) {
@@ -1133,30 +1137,15 @@ int search_from_candidates(
         vt.set(v1);
     }
 
-    int nstep = 0;
-
-    while (candidates.size() > 0) { // candidates is heap of size max(efs, k)
-        float d0 = 0;
-        int v0 = candidates.pop_min(&d0);
-
-        if (do_dis_check) {
-            // tricky stopping condition: there are more that ef
-            // distances that are processed already that are smaller
-            // than d0
-
-            int n_dis_below = candidates.count_below(d0);
-            if (n_dis_below >= efSearch) {
-                break;
-            }
-        }
-
+    auto expand_candidate = [&](int v0) {
         size_t begin, end;
         hnsw.neighbor_range(v0, level, &begin, &end);
 
         for (size_t j = begin; j < end; j++) {
             int v1 = hnsw.neighbors[j];
-            if (v1 < 0)
+            if (v1 < 0) {
                 break;
+            }
             if (vt.get(v1)) {
                 continue;
             }
@@ -1172,10 +1161,34 @@ int search_from_candidates(
             }
             candidates.push(v1, d);
         }
+    };
 
-        nstep++;
-        if (!do_dis_check && nstep > efSearch) {
-            break;
+    int nstep = 0;
+    bool should_stop = false;
+
+    while (candidates.size() > 0 && !should_stop) {
+        int expanded = 0;
+        while (expanded < pathwise_width && candidates.size() > 0) {
+            float d0 = 0;
+            int v0 = candidates.pop_min(&d0);
+
+            if (do_dis_check) {
+                int n_dis_below = candidates.count_below(d0);
+                if (n_dis_below >= efSearch) {
+                    should_stop = true;
+                    break;
+                }
+            }
+
+            expand_candidate(v0);
+
+            nstep++;
+            if (!do_dis_check && nstep > efSearch) {
+                should_stop = true;
+                break;
+            }
+
+            expanded++;
         }
     }
 
@@ -1217,6 +1230,8 @@ int hybrid_search_from_candidates(
     bool do_dis_check = params ? params->check_relative_distance
                                : hnsw.check_relative_distance;
     int efSearch = params ? params->efSearch : hnsw.efSearch;
+    int pathwise_width = params ? std::max(1, params->pathwise_width)
+                                : std::max(1, hnsw.pathwise_width);
     const IDSelector* sel = params ? params->sel : nullptr;
 
     for (int i = 0; i < candidates.size(); i++) {
@@ -1233,166 +1248,115 @@ int hybrid_search_from_candidates(
         vt.set(v1);
     }
 
-    int nstep = 0;
-
-
-    // timing variables
-    double t1_candidates_loop = elapsed();
-    
-    while (candidates.size() > 0) { // candidates is heap of size max(efs, k)
-        float d0 = 0;
-        int v0 = candidates.pop_min(&d0);
-        // debug_search("--------visiting v0: %d, d0: %f, candidates_size: %d\n", v0, d0, candidates.size());
-
-        if (do_dis_check) {
-            // tricky stopping condition: there are more that ef
-            // distances that are processed already that are smaller
-            // than d0
-            int n_dis_below = candidates.count_below(d0);
-            if (n_dis_below >= efSearch) {
-                // debug("--------%s\n", "n_dis_below >= efSearch BREAK cond reached");
-                // debug_search("--------n_dis_below: %d, efSearch: %d - triggers break\n", n_dis_below, efSearch);
-                break;
-            }
-        }
-
+    auto expand_candidate = [&](int v0) {
         size_t begin, end;
         hnsw.neighbor_range(v0, level, &begin, &end);
 
-        // variable to keep track of search expansion
         int num_found = 0;
-        int num_new = 0;
         bool keep_expanding = true;
 
-        // for debugging, collect all neighbors looked at in a vector
-        std::vector<std::pair<storage_idx_t, int>> neighbors_checked;
-
-        double t1_neighbors_loop = elapsed();
         for (size_t j = begin; j < end; j++) {
-            // auto [v1, metadata] = hnsw.neighbors[j];
-            bool promising = 0;
-            bool outerskip = false;
-
             auto v1 = hnsw.neighbors[j];
-            // auto metadata = hnsw.metadata[v1];
-            // debug_search("------------visiting neighbor (%ld) - %d, metadata: %d\n", j-begin, v1, metadata);
-
-
             if (v1 < 0) {
                 break;
             }
 
-            // note that this slows down search performance significantly
-            // if (debugSearchFlag) {
-            //     neighbors_checked.push_back(std::make_pair(v1, metadata)); // for debugging
-            // }
             if (filter_map[v1]) {
-               num_found = num_found + 1; // increment num found
+                num_found++;
             }
-            
+
             if (vt.get(v1)) {
                 continue;
             }
 
-
-            // filter
             if (filter_map[v1]) {
                 vt.set(v1);
-                num_new = num_new + 1; // increment num new
                 ndis++;
                 float d = qdis(v1);
-                // debug_search("------------new candidate %d, distance: %f\n", v1, d);
 
                 if (!sel || sel->is_member(v1)) {
                     if (nres < k) {
-                        // debug_search("-----------------pushing new candidate, nres: %d (to be incrd)\n", nres);
                         faiss::maxheap_push(++nres, D, I, d, v1);
-                        // debug_search("-----------------pushed new candidate, nres: %d\n", nres);
-                        promising = 1;
                     } else if (d < D[0]) {
-                        // debug_search("-----------------replacing top, nres: %d\n", nres);
                         faiss::maxheap_replace_top(nres, D, I, d, v1);
-                        promising =1;
                     }
                 }
                 candidates.push(v1, d);
 
                 if (num_found >= hnsw.M * 2) {
-                    // debug_search("------------num_found: %d, M: %d - triggered outer brea, skpping to M_beta=%d neighbork\n", num_found, hnsw.M * 2, hnsw.M_beta);
                     keep_expanding = false;
                     break;
                 }
-            }    
-            
-            if (((j - begin >= hnsw.M_beta) && keep_expanding) || hnsw.gamma == 1) {
-                debug_search("------------expanding neighbor list for %d; neighbor %ld, hnsw.M_beta: %d\n", v1, j-begin, hnsw.M_beta);
+            }
+
+            if ((((int)(j - begin) >= hnsw.M_beta) && keep_expanding) ||
+                hnsw.gamma == 1) {
                 size_t begin2, end2;
                 hnsw.neighbor_range(v1, level, &begin2, &end2);
-                // try to parallelize neighbor expansion
-                for (size_t j2 = begin2; j2 < end2; j2+=1) {
-                    
+                for (size_t j2 = begin2; j2 < end2; j2 += 1) {
                     auto v2 = hnsw.neighbors[j2];
 
-                    // note that this slows down search performance significantly when flag is on
-                    // if (debugSearchFlag) {
-                    //     neighbors_checked.push_back(std::make_pair(v2, metadata2)); // for debugging
-                    // }
                     if (v2 < 0) {
-                        // continue;
                         break;
                     }
 
-                    // if (metadata2 == filter) {
                     if (filter_map[v2]) {
-                        num_found = num_found + 1; // increment num found
+                        num_found++;
                     } else {
                         continue;
                     }
 
-        
-
                     if (vt.get(v2)) {
                         continue;
                     }
-                    
+
                     vt.set(v2);
                     ndis++;
-  
+
                     float d2 = qdis(v2);
-                    // debug_search("------------new candidate from expansion %d, distance: %f\n", v2, d2);
                     if (!sel || sel->is_member(v2)) {
                         if (nres < k) {
-                            // debug_search("-----------------pushing new candidate, nres: %d (to be incrd)\n", nres);
                             faiss::maxheap_push(++nres, D, I, d2, v2);
-                            // debug_search("-----------------pushed new candidate, nres: %d\n", nres);
-
                         } else if (d2 < D[0]) {
-                            // debug_search("-----------------replacing top, nres: %d\n", nres);
                             faiss::maxheap_replace_top(nres, D, I, d2, v2);
                         }
                     }
                     candidates.push(v2, d2);
                     if (num_found >= hnsw.M * 2) {
-    
-                        // debug_search("------------num_found: %d, 2M: %d - triggers break\n", num_found, hnsw.M * 2);
                         keep_expanding = false;
                         break;
                     }
                 }
-
-
-    
             }
-        
-            
         }
+    };
 
-     
-        
+    int nstep = 0;
+    bool should_stop = false;
 
-        nstep++; 
-        if (!do_dis_check && nstep > efSearch) {
-            break;
+    while (candidates.size() > 0 && !should_stop) {
+        int expanded = 0;
+        while (expanded < pathwise_width && candidates.size() > 0) {
+            float d0 = 0;
+            int v0 = candidates.pop_min(&d0);
+
+            if (do_dis_check) {
+                int n_dis_below = candidates.count_below(d0);
+                if (n_dis_below >= efSearch) {
+                    should_stop = true;
+                    break;
+                }
+            }
+
+            expand_candidate(v0);
+
+            nstep++;
+            if (!do_dis_check && nstep > efSearch) {
+                should_stop = true;
+                break;
+            }
+
+            expanded++;
         }
     }
 

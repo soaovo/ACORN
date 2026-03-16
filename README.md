@@ -57,4 +57,9 @@ for (int xq = 0; xq < nq; xq++) {
 
 // perform efficient hybrid search
 acorn_gamma.search(nq, xq, k, dis2.data(), nns2.data(), filter_ids_map.data());
+
+// optionally enable path-wise candidate expansion (process multiple paths per iteration)
+faiss::SearchParametersACORN params;
+params.pathwise_width = 4; // expand 4 candidates before each synchronization
+acorn_gamma.search(nq, xq, k, dis2.data(), nns2.data(), filter_ids_map.data(), &params);
 ```

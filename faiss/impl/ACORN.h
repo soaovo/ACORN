@@ -39,6 +39,7 @@ struct ACORNStats;
 struct SearchParametersACORN : SearchParameters {
     int efSearch = 16;
     bool check_relative_distance = true;
+    int pathwise_width = 1;
 
     ~SearchParametersACORN() {}
 };
@@ -140,6 +141,9 @@ struct ACORN {
 
     /// expansion factor at search time
     int efSearch;
+
+    /// number of candidates expanded together (path-wise width)
+    int pathwise_width;
 
     /// during search: do we check whether the next best distance is good
     /// enough?
