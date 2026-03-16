@@ -40,6 +40,7 @@ struct SearchParametersACORN : SearchParameters {
     int efSearch = 16;
     bool check_relative_distance = true;
     int pathwise_width = 1;
+    int edgewise_nt = 0; // 0 -> use omp_get_max_threads()
 
     ~SearchParametersACORN() {}
 };
@@ -228,7 +229,8 @@ struct ACORN {
             idx_t* I,
             float* D,
             VisitedTable& vt,
-            const SearchParametersACORN* params = nullptr) const;
+            const SearchParametersACORN* params = nullptr,
+            std::vector<DistanceComputer*>* dc_pool = nullptr) const;
 
 
     
@@ -251,7 +253,8 @@ struct ACORN {
             // int filter,
             // Operation op,
             // std::string regex,
-            const SearchParametersACORN* params = nullptr) const;
+            const SearchParametersACORN* params = nullptr,
+            std::vector<DistanceComputer*>* dc_pool = nullptr) const;
 
     /**************************************************************
     **************************************************************/

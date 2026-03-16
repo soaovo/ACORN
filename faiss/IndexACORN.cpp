@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <memory>
 #include <queue>
 #include <unordered_set>
 
@@ -316,43 +317,63 @@ void IndexACORN::search(
     idx_t check_period =
             InterruptCallback::get_period_hint(acorn.max_level * d * efSearch);
 
+    auto compute_edgewise_threads = [&](const SearchParametersACORN* sp) {
+        int edgewise_nt = sp ? sp->edgewise_nt : 0;
+        if (edgewise_nt <= 0) {
+            edgewise_nt = omp_get_max_threads();
+        }
+        return std::max(1, edgewise_nt);
+    };
+
+    int default_edgewise_nt = compute_edgewise_threads(params);
+
     for (idx_t i0 = 0; i0 < n; i0 += check_period) {
         idx_t i1 = std::min(i0 + check_period, n);
 
-#pragma omp parallel
-        {
+        for (idx_t i = i0; i < i1; i++) {
             VisitedTable vt(ntotal);
 
-            DistanceComputer* dis = storage_distance_computer(storage);
-            ScopeDeleter1<DistanceComputer> del(dis);
-
-#pragma omp for reduction(+ : n1, n2, n3, ndis, nreorder, candidates_loop)
-            for (idx_t i = i0; i < i1; i++) {
-                idx_t* idxi = labels + i * k;
-                float* simi = distances + i * k;
-                char* filters = filter_id_map + i * ntotal;
-                dis->set_query(x + i * d);
-
-                maxheap_heapify(k, simi, idxi);
-                ACORNStats stats = acorn.hybrid_search(*dis, k, idxi, simi, vt, filters, params); //TODO edit to hybrid search
-
-                // ACORNStats stats = acorn.hybrid_search(*dis, k, idxi, simi, vt, filters[i], op, regex, params); //TODO edit to hybrid search
-                n1 += stats.n1;
-                n2 += stats.n2;
-                n3 += stats.n3;
-                ndis += stats.ndis;
-                nreorder += stats.nreorder;
-                // printf("index -- stats updates: %f\n", stats.candidates_loop);
-                // printf("index -- stats updates: %f\n", stats.neighbors_loop);
-                //added for profiling
-                candidates_loop += stats.candidates_loop; 
-                neighbors_loop += stats.neighbors_loop;
-                tuple_unwrap += stats.tuple_unwrap;
-                skips += stats.skips;
-                visits += stats.visits;
-                maxheap_reorder(k, simi, idxi);
-                
+            int edgewise_nt = default_edgewise_nt;
+            std::vector<std::unique_ptr<DistanceComputer>> dc_storage(edgewise_nt);
+            std::vector<DistanceComputer*> dc_raw;
+            if (edgewise_nt > 1) {
+                dc_raw.reserve(edgewise_nt);
             }
+            for (int t = 0; t < edgewise_nt; ++t) {
+                dc_storage[t].reset(storage_distance_computer(storage));
+                dc_storage[t]->set_query(x + i * d);
+                if (edgewise_nt > 1) {
+                    dc_raw.push_back(dc_storage[t].get());
+                }
+            }
+
+            DistanceComputer& dis = *dc_storage[0];
+            idx_t* idxi = labels + i * k;
+            float* simi = distances + i * k;
+            char* filters = filter_id_map + i * ntotal;
+
+            maxheap_heapify(k, simi, idxi);
+            ACORNStats stats = acorn.hybrid_search(
+                    dis,
+                    k,
+                    idxi,
+                    simi,
+                    vt,
+                    filters,
+                    params,
+                    edgewise_nt > 1 ? &dc_raw : nullptr);
+
+            n1 += stats.n1;
+            n2 += stats.n2;
+            n3 += stats.n3;
+            ndis += stats.ndis;
+            nreorder += stats.nreorder;
+            candidates_loop += stats.candidates_loop;
+            neighbors_loop += stats.neighbors_loop;
+            tuple_unwrap += stats.tuple_unwrap;
+            skips += stats.skips;
+            visits += stats.visits;
+            maxheap_reorder(k, simi, idxi);
         }
         InterruptCallback::check();
     }
@@ -392,33 +413,56 @@ void IndexACORN::search(
     idx_t check_period =
             InterruptCallback::get_period_hint(acorn.max_level * d * efSearch);
 
+    auto compute_edgewise_threads = [&](const SearchParametersACORN* sp) {
+        int edgewise_nt = sp ? sp->edgewise_nt : 0;
+        if (edgewise_nt <= 0) {
+            edgewise_nt = omp_get_max_threads();
+        }
+        return std::max(1, edgewise_nt);
+    };
+
+    int default_edgewise_nt = compute_edgewise_threads(params);
+
     for (idx_t i0 = 0; i0 < n; i0 += check_period) {
         idx_t i1 = std::min(i0 + check_period, n);
 
-#pragma omp parallel
-        {
+        for (idx_t i = i0; i < i1; i++) {
             VisitedTable vt(ntotal);
 
-            DistanceComputer* dis = storage_distance_computer(storage);
-            ScopeDeleter1<DistanceComputer> del(dis);
-
-#pragma omp for reduction(+ : n1, n2, n3, ndis, nreorder)
-            for (idx_t i = i0; i < i1; i++) {
-                idx_t* idxi = labels + i * k;
-                float* simi = distances + i * k;
-                dis->set_query(x + i * d);
-
-                maxheap_heapify(k, simi, idxi);
-                ACORNStats stats = acorn.search(*dis, k, idxi, simi, vt, params);
-                n1 += stats.n1;
-                n2 += stats.n2;
-                n3 += stats.n3;
-                ndis += stats.ndis;
-                nreorder += stats.nreorder;
-                maxheap_reorder(k, simi, idxi);
-
-                
+            int edgewise_nt = default_edgewise_nt;
+            std::vector<std::unique_ptr<DistanceComputer>> dc_storage(edgewise_nt);
+            std::vector<DistanceComputer*> dc_raw;
+            if (edgewise_nt > 1) {
+                dc_raw.reserve(edgewise_nt);
             }
+
+            for (int t = 0; t < edgewise_nt; ++t) {
+                dc_storage[t].reset(storage_distance_computer(storage));
+                dc_storage[t]->set_query(x + i * d);
+                if (edgewise_nt > 1) {
+                    dc_raw.push_back(dc_storage[t].get());
+                }
+            }
+
+            DistanceComputer& dis = *dc_storage[0];
+            idx_t* idxi = labels + i * k;
+            float* simi = distances + i * k;
+
+            maxheap_heapify(k, simi, idxi);
+            ACORNStats stats = acorn.search(
+                    dis,
+                    k,
+                    idxi,
+                    simi,
+                    vt,
+                    params,
+                    edgewise_nt > 1 ? &dc_raw : nullptr);
+            n1 += stats.n1;
+            n2 += stats.n2;
+            n3 += stats.n3;
+            ndis += stats.ndis;
+            nreorder += stats.nreorder;
+            maxheap_reorder(k, simi, idxi);
         }
         InterruptCallback::check();
     }

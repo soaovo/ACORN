@@ -1110,7 +1110,8 @@ int search_from_candidates(
         ACORNStats& stats,
         int level,
         int nres_in = 0,
-        const SearchParametersACORN* params = nullptr) {
+        const SearchParametersACORN* params = nullptr,
+        std::vector<DistanceComputer*>* dc_pool = nullptr) {
     debug("%s\n", "reached");
     int nres = nres_in;
     int ndis = 0;
@@ -1140,6 +1141,71 @@ int search_from_candidates(
     auto expand_candidate = [&](int v0) {
         size_t begin, end;
         hnsw.neighbor_range(v0, level, &begin, &end);
+        size_t degree = end - begin;
+
+        bool use_edgewise = dc_pool && dc_pool->size() > 1 &&
+                degree >= dc_pool->size() * 2;
+
+#if defined(_OPENMP)
+        if (use_edgewise) {
+            int worker_count = static_cast<int>(dc_pool->size());
+            std::vector<std::vector<std::pair<int, float>>> local_candidates(
+                    worker_count);
+            std::vector<int> local_ndis(worker_count, 0);
+
+#pragma omp parallel num_threads(worker_count)
+            {
+                int tid = omp_get_thread_num();
+                DistanceComputer& worker = *(*dc_pool)[tid];
+                auto& local = local_candidates[tid];
+                int local_count = 0;
+
+#pragma omp for schedule(static)
+                for (int offset = 0; offset < (int)degree; ++offset) {
+                    size_t j = begin + offset;
+                    int v1 = hnsw.neighbors[j];
+                    if (v1 < 0) {
+                        continue;
+                    }
+                    bool inserted = false;
+                    if (!vt.get(v1)) {
+#pragma omp critical(acorn_edgewise_visit)
+                        {
+                            if (!vt.get(v1)) {
+                                vt.set(v1);
+                                inserted = true;
+                            }
+                        }
+                    }
+                    if (!inserted) {
+                        continue;
+                    }
+                    local_count++;
+                    float d = worker(v1);
+                    local.emplace_back(v1, d);
+                }
+
+                local_ndis[tid] = local_count;
+            }
+
+            for (int tid = 0; tid < worker_count; ++tid) {
+                ndis += local_ndis[tid];
+                for (auto& entry : local_candidates[tid]) {
+                    int v1 = entry.first;
+                    float d = entry.second;
+                    if (!sel || sel->is_member(v1)) {
+                        if (nres < k) {
+                            faiss::maxheap_push(++nres, D, I, d, v1);
+                        } else if (d < D[0]) {
+                            faiss::maxheap_replace_top(nres, D, I, d, v1);
+                        }
+                    }
+                    candidates.push(v1, d);
+                }
+            }
+            return;
+        }
+#endif
 
         for (size_t j = begin; j < end; j++) {
             int v1 = hnsw.neighbors[j];
@@ -1219,7 +1285,8 @@ int hybrid_search_from_candidates(
         ACORNStats& stats,
         int level,
         int nres_in = 0,
-        const SearchParametersACORN* params = nullptr) {
+        const SearchParametersACORN* params = nullptr,
+        std::vector<DistanceComputer*>* /*dc_pool*/ = nullptr) {
     // debug("%s\n", "reached");
     // printf("----hybrid_search_from_candidates called with filter: %d, k: %d, op: %d, regex: %s\n", filter, k, op, regex.c_str());
     // debug_search("----hybrid_search_from_candidates called with filter: %d, k: %d\n", filter, k);
@@ -1387,7 +1454,8 @@ ACORNStats ACORN::search(
         idx_t* I,
         float* D,
         VisitedTable& vt,
-        const SearchParametersACORN* params) const {
+        const SearchParametersACORN* params,
+        std::vector<DistanceComputer*>* dc_pool) const {
     debug("%s\n", "reached");
     ACORNStats stats;
     if (entry_point == -1) {
@@ -1414,7 +1482,18 @@ ACORNStats ACORN::search(
             candidates.push(nearest, d_nearest);
 
             search_from_candidates(
-                    *this, qdis, k, I, D, candidates, vt, stats, 0, 0, params);
+                    *this,
+                    qdis,
+                    k,
+                    I,
+                    D,
+                    candidates,
+                    vt,
+                    stats,
+                    0,
+                    0,
+                    params,
+                    dc_pool);
         } else {
             debug("%s\n", "reached search_bounded_queue == False");
             throw FaissException("UNIMPLEMENTED search unbounded queue");
@@ -1447,7 +1526,18 @@ ACORNStats ACORN::search(
 
             if (level == 0) {
                 nres = search_from_candidates(
-                        *this, qdis, k, I, D, candidates, vt, stats, 0);
+                        *this,
+                        qdis,
+                        k,
+                        I,
+                        D,
+                        candidates,
+                        vt,
+                        stats,
+                        0,
+                        0,
+                        params,
+                        dc_pool);
             } else {
                 nres = search_from_candidates(
                         *this,
@@ -1458,7 +1548,10 @@ ACORNStats ACORN::search(
                         candidates,
                         vt,
                         stats,
-                        level);
+                        level,
+                        0,
+                        params,
+                        dc_pool);
             }
             vt.advance();
         }
@@ -1479,7 +1572,8 @@ ACORNStats ACORN::hybrid_search(
         // int filter,
         // Operation op,
         // std::string regex,
-        const SearchParametersACORN* params) const {
+        const SearchParametersACORN* params,
+        std::vector<DistanceComputer*>* dc_pool) const {
     debug("%s\n", "reached");
     // debug_search("Hybrid Search, params -- k: %d, filter: %d\n", k, filter);
     ACORNStats stats;
@@ -1517,7 +1611,18 @@ ACORNStats ACORN::hybrid_search(
             candidates.push(nearest, d_nearest);
             debug_search("-starting BFS at level 0 with ef: %d, nearest: %d, d: %f, metadata: %d\n", ef, nearest, d_nearest, metadata[nearest]);
             hybrid_search_from_candidates(
-                    *this, qdis, filter_map, k, I, D, candidates, vt, stats, 0, 0, params);
+                    *this,
+                    qdis,
+                    filter_map,
+                    k,
+                    I,
+                    D,
+                    candidates,
+                    vt,
+                    stats,
+                    0,
+                    0,
+                    params);
             
 
         } else {
@@ -1555,7 +1660,18 @@ ACORNStats ACORN::hybrid_search(
 
             if (level == 0) {
                 nres = hybrid_search_from_candidates(
-                        *this, qdis, filter_map, k, I, D, candidates, vt, stats, 0);
+                        *this,
+                        qdis,
+                        filter_map,
+                        k,
+                        I,
+                        D,
+                        candidates,
+                        vt,
+                        stats,
+                        0,
+                        0,
+                        params);
             
                 
             } else {
@@ -1572,7 +1688,9 @@ ACORNStats ACORN::hybrid_search(
                         candidates,
                         vt,
                         stats,
-                        level);
+                        level,
+                        0,
+                        params);
             }
             vt.advance();
         }

@@ -62,4 +62,8 @@ acorn_gamma.search(nq, xq, k, dis2.data(), nns2.data(), filter_ids_map.data());
 faiss::SearchParametersACORN params;
 params.pathwise_width = 4; // expand 4 candidates before each synchronization
 acorn_gamma.search(nq, xq, k, dis2.data(), nns2.data(), filter_ids_map.data(), &params);
+
+// enable edge-wise expansion so a single query can use multiple CPU threads
+params.edgewise_nt = 8; // number of threads to split neighbor lists across
+acorn_gamma.search(nq, xq, k, dis2.data(), nns2.data(), filter_ids_map.data(), &params);
 ```
