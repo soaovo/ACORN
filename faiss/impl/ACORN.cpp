@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <iostream>
 #include <fstream>
+#define _OPENMP 1
 /*******************************************************
  * Added for debugging
  *******************************************************/

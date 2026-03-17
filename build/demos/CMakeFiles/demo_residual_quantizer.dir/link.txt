@@ -1,1 +1,0 @@
-/opt/rh/devtoolset-9/root/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/demo_residual_quantizer.dir/demo_residual_quantizer.cpp.o -o demo_residual_quantizer  -Wl,-rpath,/home/cxy/ACORN/ACORN/build/faiss ../faiss/libfaiss.so /usr/lib64/libz.so 
