@@ -1147,7 +1147,9 @@ int search_from_candidates(
                 degree >= dc_pool->size() * 2;
 
 #if defined(_OPENMP)
+        printf("!!!123");
         if (use_edgewise) {
+            printf("!!!456");
             int worker_count = static_cast<int>(dc_pool->size());
             std::vector<std::vector<std::pair<int, float>>> local_candidates(
                     worker_count);
