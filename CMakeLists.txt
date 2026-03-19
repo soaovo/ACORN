@@ -87,8 +87,6 @@ if(NOT NLOHMANN_JSON_INCLUDE_DIR)
   set(NLOHMANN_JSON_INCLUDE_DIR "${nlohmann_json_SOURCE_DIR}/include")
 endif()
 
-target_include_directories(faiss PUBLIC ${NLOHMANN_JSON_INCLUDE_DIR})
-
 find_package(ZLIB REQUIRED)
 target_link_libraries(faiss PUBLIC ${ZLIB_LIBRARIES})
 
