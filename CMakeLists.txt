@@ -56,28 +56,38 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-# include(FetchContent)
-
-# FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.2/json.tar.xz)
-# FetchContent_MakeAvailable(json)
-
-# # target_link_libraries(foo PRIVATE nlohmann_json::nlohmann_json)
-
-include(FetchContent)
-
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.10.4
+set(NLOHMANN_JSON_INCLUDE_DIR "")
+set(NLOHMANN_JSON_LOCAL_CANDIDATES
+  "${PROJECT_SOURCE_DIR}/../local/nlohmann_json-src/include"
+  "${PROJECT_SOURCE_DIR}/local/nlohmann_json-src/include"
 )
 
-FetchContent_GetProperties(nlohmann_json)
-if(NOT nlohmann_json_POPULATED)
-    FetchContent_Populate(nlohmann_json)
-    add_subdirectory(${nlohmann_json_SOURCE_DIR} ${nlohmann_json_BINARY_DIR})
+foreach(candidate ${NLOHMANN_JSON_LOCAL_CANDIDATES})
+  if(EXISTS "${candidate}/nlohmann/json.hpp")
+    set(NLOHMANN_JSON_INCLUDE_DIR "${candidate}")
+    break()
+  endif()
+endforeach()
+
+if(NOT NLOHMANN_JSON_INCLUDE_DIR)
+  include(FetchContent)
+
+  FetchContent_Declare(
+      nlohmann_json
+      GIT_REPOSITORY https://github.com/nlohmann/json.git
+      GIT_TAG v3.10.4
+  )
+
+  FetchContent_GetProperties(nlohmann_json)
+  if(NOT nlohmann_json_POPULATED)
+      FetchContent_Populate(nlohmann_json)
+      add_subdirectory(${nlohmann_json_SOURCE_DIR} ${nlohmann_json_BINARY_DIR})
+  endif()
+
+  set(NLOHMANN_JSON_INCLUDE_DIR "${nlohmann_json_SOURCE_DIR}/include")
 endif()
 
-target_include_directories(faiss PUBLIC ${nlohmann_json_SOURCE_DIR}/include)
+target_include_directories(faiss PUBLIC ${NLOHMANN_JSON_INCLUDE_DIR})
 
 find_package(ZLIB REQUIRED)
 target_link_libraries(faiss PUBLIC ${ZLIB_LIBRARIES})
