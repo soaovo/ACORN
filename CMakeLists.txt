@@ -38,24 +38,6 @@ if(FAISS_ENABLE_PYTHON)
   add_subdirectory(faiss/python)
 endif()
 
-if(FAISS_ENABLE_C_API)
-  add_subdirectory(c_api)
-endif()
-
-add_subdirectory(demos)
-add_subdirectory(benchs)
-add_subdirectory(tutorial/cpp)
-
-# CTest must be included in the top level to enable `make test` target.
-include(CTest)
-if(BUILD_TESTING)
-  add_subdirectory(tests)
-
-  if(FAISS_ENABLE_GPU)
-    add_subdirectory(faiss/gpu/test)
-  endif()
-endif()
-
 set(NLOHMANN_JSON_INCLUDE_DIR "")
 set(NLOHMANN_JSON_LOCAL_CANDIDATES
   "${PROJECT_SOURCE_DIR}/../local/nlohmann_json-src/include"
@@ -85,6 +67,24 @@ if(NOT NLOHMANN_JSON_INCLUDE_DIR)
   endif()
 
   set(NLOHMANN_JSON_INCLUDE_DIR "${nlohmann_json_SOURCE_DIR}/include")
+endif()
+
+if(FAISS_ENABLE_C_API)
+  add_subdirectory(c_api)
+endif()
+
+add_subdirectory(demos)
+add_subdirectory(benchs)
+add_subdirectory(tutorial/cpp)
+
+# CTest must be included in the top level to enable `make test` target.
+include(CTest)
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+
+  if(FAISS_ENABLE_GPU)
+    add_subdirectory(faiss/gpu/test)
+  endif()
 endif()
 
 find_package(ZLIB REQUIRED)
