@@ -10,6 +10,9 @@
 #include <faiss/impl/ACORN.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdarg>
+#include <cstdlib>
 #include <string>
 
 #include <faiss/impl/AuxIndexStructures.h>
@@ -33,6 +36,31 @@ const int debugFlag = 0;
 // const int debugSearchFlag =  std::atoi(std::getenv(debugSearchFlag));
 const char* debugSearchFlagEnv = std::getenv("debugSearchFlag");
 int debugSearchFlag = debugSearchFlagEnv ? std::atoi(debugSearchFlagEnv) : 0;
+
+int getenv_int_or_default(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    return value ? std::atoi(value) : default_value;
+}
+
+const int hybridDebugQuery = getenv_int_or_default("ACORN_DEBUG_HYBRID_QUERY", -1);
+const int hybridDebugExpansionLimit =
+        getenv_int_or_default("ACORN_DEBUG_HYBRID_EXPANSIONS", 4);
+
+std::atomic<int> hybridDebugSearchCounter{0};
+thread_local int hybridDebugActiveQuery = -1;
+thread_local bool hybridDebugEnabled = false;
+thread_local int hybridDebugExpansionCount = 0;
+
+void hybrid_debug_log(const char* fmt, ...) {
+    if (!hybridDebugEnabled) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stdout, fmt, args);
+    va_end(args);
+    fflush(stdout);
+}
 
 
 void debugTime() {
@@ -1321,6 +1349,20 @@ int hybrid_search_from_candidates(
 
         int num_found = 0;
         bool keep_expanding = true;
+        bool trace_expansion = hybridDebugEnabled &&
+                hybridDebugExpansionCount < hybridDebugExpansionLimit;
+
+        if (trace_expansion) {
+            hybrid_debug_log(
+                    "[hybrid-debug q=%d] expand #%d v0=%d queue_before=%d nres=%d range=%zu\n",
+                    hybridDebugActiveQuery,
+                    hybridDebugExpansionCount,
+                    v0,
+                    candidates.size(),
+                    nres,
+                    end - begin);
+            hybridDebugExpansionCount++;
+        }
 
         auto push_result = [&](int id, float distance) {
             if (!sel || sel->is_member(id)) {
@@ -1333,7 +1375,7 @@ int hybrid_search_from_candidates(
             candidates.push(id, distance);
         };
 
-        auto score_pending = [&](const std::vector<int>& ids) {
+        auto score_pending = [&](const std::vector<int>& ids, const char* hop) {
             if (ids.empty()) {
                 return;
             }
@@ -1344,6 +1386,15 @@ int hybrid_search_from_candidates(
             if (use_edgewise) {
                 int worker_count = static_cast<int>(dc_pool->size());
                 std::vector<float> distances(ids.size());
+
+                if (trace_expansion) {
+                    hybrid_debug_log(
+                            "  [hybrid-debug q=%d] %s batch=%zu edgewise=1 workers=%d\n",
+                            hybridDebugActiveQuery,
+                            hop,
+                            ids.size(),
+                            worker_count);
+                }
 
 #pragma omp parallel num_threads(worker_count)
                 {
@@ -1359,14 +1410,43 @@ int hybrid_search_from_candidates(
                 ndis += ids.size();
                 for (size_t idx = 0; idx < ids.size(); ++idx) {
                     push_result(ids[idx], distances[idx]);
+                    if (trace_expansion) {
+                        hybrid_debug_log(
+                                "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
+                                hybridDebugActiveQuery,
+                                hop,
+                                ids[idx],
+                                distances[idx],
+                                nres,
+                                candidates.size());
+                    }
                 }
                 return;
             }
 #endif
 
+            if (trace_expansion) {
+                hybrid_debug_log(
+                        "  [hybrid-debug q=%d] %s batch=%zu edgewise=0\n",
+                        hybridDebugActiveQuery,
+                        hop,
+                        ids.size());
+            }
+
             ndis += ids.size();
             for (int id : ids) {
-                push_result(id, qdis(id));
+                float distance = qdis(id);
+                push_result(id, distance);
+                if (trace_expansion) {
+                    hybrid_debug_log(
+                            "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
+                            hybridDebugActiveQuery,
+                            hop,
+                            id,
+                            distance,
+                            nres,
+                            candidates.size());
+                }
             }
         };
 
@@ -1381,16 +1461,42 @@ int hybrid_search_from_candidates(
             }
 
             if (vt.get(v1)) {
+                if (trace_expansion) {
+                    hybrid_debug_log(
+                            "  [hybrid-debug q=%d] L1 skip id=%d filter=%d visited=1 num_found=%d\n",
+                            hybridDebugActiveQuery,
+                            v1,
+                            filter_map[v1],
+                            num_found);
+                }
                 continue;
             }
 
             if (filter_map[v1]) {
                 vt.set(v1);
                 ndis++;
-                push_result(v1, qdis(v1));
+                float distance = qdis(v1);
+                push_result(v1, distance);
+                if (trace_expansion) {
+                    hybrid_debug_log(
+                            "  [hybrid-debug q=%d] L1 push id=%d dis=%g num_found=%d nres=%d cand=%d\n",
+                            hybridDebugActiveQuery,
+                            v1,
+                            distance,
+                            num_found,
+                            nres,
+                            candidates.size());
+                }
 
                 if (num_found >= hnsw.M * 2) {
                     keep_expanding = false;
+                    if (trace_expansion) {
+                        hybrid_debug_log(
+                                "  [hybrid-debug q=%d] L1 stop num_found=%d threshold=%d\n",
+                                hybridDebugActiveQuery,
+                                num_found,
+                                hnsw.M * 2);
+                    }
                     break;
                 }
             }
@@ -1400,6 +1506,14 @@ int hybrid_search_from_candidates(
                 size_t begin2, end2;
                 std::vector<int> second_hop_hits;
                 hnsw.neighbor_range(v1, level, &begin2, &end2);
+                if (trace_expansion) {
+                    hybrid_debug_log(
+                            "  [hybrid-debug q=%d] expand L2 from id=%d offset=%zu keep=%d\n",
+                            hybridDebugActiveQuery,
+                            v1,
+                            j - begin,
+                            keep_expanding ? 1 : 0);
+                }
                 for (size_t j2 = begin2; j2 < end2; j2 += 1) {
                     auto v2 = hnsw.neighbors[j2];
 
@@ -1414,6 +1528,13 @@ int hybrid_search_from_candidates(
                     }
 
                     if (vt.get(v2)) {
+                        if (trace_expansion) {
+                            hybrid_debug_log(
+                                    "    [hybrid-debug q=%d] L2 skip id=%d visited=1 num_found=%d\n",
+                                    hybridDebugActiveQuery,
+                                    v2,
+                                    num_found);
+                        }
                         continue;
                     }
 
@@ -1421,11 +1542,18 @@ int hybrid_search_from_candidates(
                     second_hop_hits.push_back(v2);
                     if (num_found >= hnsw.M * 2) {
                         keep_expanding = false;
+                        if (trace_expansion) {
+                            hybrid_debug_log(
+                                    "    [hybrid-debug q=%d] L2 stop num_found=%d threshold=%d\n",
+                                    hybridDebugActiveQuery,
+                                    num_found,
+                                    hnsw.M * 2);
+                        }
                         break;
                     }
                 }
 
-                score_pending(second_hop_hits);
+                score_pending(second_hop_hits, "L2");
             }
         }
     };
@@ -1442,12 +1570,32 @@ int hybrid_search_from_candidates(
             if (do_dis_check) {
                 int n_dis_below = candidates.count_below(d0);
                 if (n_dis_below >= efSearch) {
+                    if (hybridDebugEnabled) {
+                        hybrid_debug_log(
+                                "[hybrid-debug q=%d] stop by dis_check d0=%g below=%d ef=%d queue=%d nres=%d\n",
+                                hybridDebugActiveQuery,
+                                d0,
+                                n_dis_below,
+                                efSearch,
+                                candidates.size(),
+                                nres);
+                    }
                     should_stop = true;
                     break;
                 }
             }
 
             expand_candidate(v0);
+
+            if (hybridDebugEnabled) {
+                hybrid_debug_log(
+                        "[hybrid-debug q=%d] post-expand v0=%d queue=%d nres=%d ndis=%d\n",
+                        hybridDebugActiveQuery,
+                        v0,
+                        candidates.size(),
+                        nres,
+                        ndis);
+            }
 
             nstep++;
             if (!do_dis_check && nstep > efSearch) {
@@ -1617,6 +1765,21 @@ ACORNStats ACORN::hybrid_search(
     if (upper_beam == 1) { // common branch
         debug("%s\n", "reached upper beam == 1");
 
+        hybridDebugActiveQuery = hybridDebugSearchCounter.fetch_add(1);
+        hybridDebugEnabled = hybridDebugActiveQuery == hybridDebugQuery;
+        hybridDebugExpansionCount = 0;
+        if (hybridDebugEnabled) {
+            hybrid_debug_log(
+                    "[hybrid-debug q=%d] start k=%d efSearch=%d pathwise_width=%d gamma=%d M=%d M_beta=%d\n",
+                    hybridDebugActiveQuery,
+                    k,
+                    efSearch,
+                    pathwise_width,
+                    gamma,
+                    M,
+                    M_beta);
+        }
+
         //  greedy search on upper levels
         storage_idx_t nearest = entry_point;
         float d_nearest = qdis(nearest);
@@ -1656,6 +1819,15 @@ ACORNStats ACORN::hybrid_search(
                     0,
                     params,
                     dc_pool);
+
+            if (hybridDebugEnabled) {
+                hybrid_debug_log(
+                        "[hybrid-debug q=%d] finished n3=%zu first_label=%lld first_dis=%g\n",
+                        hybridDebugActiveQuery,
+                        stats.n3,
+                        (long long)I[0],
+                        D[0]);
+            }
             
 
         } else {
@@ -1668,6 +1840,8 @@ ACORNStats ACORN::hybrid_search(
         }
 
         vt.advance();
+        hybridDebugEnabled = false;
+        hybridDebugActiveQuery = -1;
 
     } else {
         debug("%s\n", "reached upper beam != 1");
