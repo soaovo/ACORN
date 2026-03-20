@@ -1395,30 +1395,23 @@ int hybrid_search_from_candidates(
 #if defined(_OPENMP)
         if (use_edgewise) {
             int worker_count = static_cast<int>(dc_pool->size());
-            std::vector<std::vector<std::pair<int, float>>> local_results(
-                    worker_count);
+            std::vector<float> pending_distances(pending_ids.size());
 
 #pragma omp parallel num_threads(worker_count)
             {
                 int tid = omp_get_thread_num();
                 DistanceComputer& worker = *(*dc_pool)[tid];
-                auto& local = local_results[tid];
 
 #pragma omp for schedule(static)
                 for (int idx = 0; idx < (int)pending_ids.size(); ++idx) {
                     int id = pending_ids[idx];
-                    float distance = worker(id);
-                    local.emplace_back(id, distance);
+                    pending_distances[idx] = worker(id);
                 }
             }
 
             ndis += pending_ids.size();
-            for (int tid = 0; tid < worker_count; ++tid) {
-                for (size_t idx = 0; idx < local_results[tid].size(); ++idx) {
-                    push_result(
-                            local_results[tid][idx].first,
-                            local_results[tid][idx].second);
-                }
+            for (size_t idx = 0; idx < pending_ids.size(); ++idx) {
+                push_result(pending_ids[idx], pending_distances[idx]);
             }
             return;
         }
