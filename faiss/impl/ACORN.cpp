@@ -24,7 +24,6 @@
 #include <unordered_map>
 #include <iostream>
 #include <fstream>
-#define _OPENMP 1
 /*******************************************************
  * Added for debugging
  *******************************************************/
@@ -1148,9 +1147,7 @@ int search_from_candidates(
                 degree >= dc_pool->size() * 2;
 
 #if defined(_OPENMP)
-        printf("!!!123");
         if (use_edgewise) {
-            printf("!!!456");
             int worker_count = static_cast<int>(dc_pool->size());
             std::vector<std::vector<std::pair<int, float>>> local_candidates(
                     worker_count);
@@ -1289,7 +1286,7 @@ int hybrid_search_from_candidates(
         int level,
         int nres_in = 0,
         const SearchParametersACORN* params = nullptr,
-        std::vector<DistanceComputer*>* /*dc_pool*/ = nullptr) {
+        std::vector<DistanceComputer*>* dc_pool = nullptr) {
     // debug("%s\n", "reached");
     // printf("----hybrid_search_from_candidates called with filter: %d, k: %d, op: %d, regex: %s\n", filter, k, op, regex.c_str());
     // debug_search("----hybrid_search_from_candidates called with filter: %d, k: %d\n", filter, k);
@@ -1324,6 +1321,18 @@ int hybrid_search_from_candidates(
 
         int num_found = 0;
         bool keep_expanding = true;
+        std::vector<int> pending_ids;
+
+        auto push_result = [&](int id, float distance) {
+            if (!sel || sel->is_member(id)) {
+                if (nres < k) {
+                    faiss::maxheap_push(++nres, D, I, distance, id);
+                } else if (distance < D[0]) {
+                    faiss::maxheap_replace_top(nres, D, I, distance, id);
+                }
+            }
+            candidates.push(id, distance);
+        };
 
         for (size_t j = begin; j < end; j++) {
             auto v1 = hnsw.neighbors[j];
@@ -1341,17 +1350,7 @@ int hybrid_search_from_candidates(
 
             if (filter_map[v1]) {
                 vt.set(v1);
-                ndis++;
-                float d = qdis(v1);
-
-                if (!sel || sel->is_member(v1)) {
-                    if (nres < k) {
-                        faiss::maxheap_push(++nres, D, I, d, v1);
-                    } else if (d < D[0]) {
-                        faiss::maxheap_replace_top(nres, D, I, d, v1);
-                    }
-                }
-                candidates.push(v1, d);
+                pending_ids.push_back(v1);
 
                 if (num_found >= hnsw.M * 2) {
                     keep_expanding = false;
@@ -1381,23 +1380,55 @@ int hybrid_search_from_candidates(
                     }
 
                     vt.set(v2);
-                    ndis++;
-
-                    float d2 = qdis(v2);
-                    if (!sel || sel->is_member(v2)) {
-                        if (nres < k) {
-                            faiss::maxheap_push(++nres, D, I, d2, v2);
-                        } else if (d2 < D[0]) {
-                            faiss::maxheap_replace_top(nres, D, I, d2, v2);
-                        }
-                    }
-                    candidates.push(v2, d2);
+                    pending_ids.push_back(v2);
                     if (num_found >= hnsw.M * 2) {
                         keep_expanding = false;
                         break;
                     }
                 }
             }
+        }
+
+        bool use_edgewise = dc_pool && dc_pool->size() > 1 &&
+                pending_ids.size() >= dc_pool->size() * 2;
+
+#if defined(_OPENMP)
+        if (use_edgewise) {
+            int worker_count = static_cast<int>(dc_pool->size());
+            std::vector<std::vector<std::pair<int, float>>> local_results(
+                    worker_count);
+
+#pragma omp parallel num_threads(worker_count)
+            {
+                int tid = omp_get_thread_num();
+                DistanceComputer& worker = *(*dc_pool)[tid];
+                auto& local = local_results[tid];
+
+#pragma omp for schedule(static)
+                for (int idx = 0; idx < (int)pending_ids.size(); ++idx) {
+                    int id = pending_ids[idx];
+                    float distance = worker(id);
+                    local.emplace_back(id, distance);
+                }
+            }
+
+            ndis += pending_ids.size();
+            for (int tid = 0; tid < worker_count; ++tid) {
+                for (size_t idx = 0; idx < local_results[tid].size(); ++idx) {
+                    push_result(
+                            local_results[tid][idx].first,
+                            local_results[tid][idx].second);
+                }
+            }
+            return;
+        }
+#endif
+
+        ndis += pending_ids.size();
+        for (size_t idx = 0; idx < pending_ids.size(); ++idx) {
+            int id = pending_ids[idx];
+            float distance = qdis(id);
+            push_result(id, distance);
         }
     };
 
