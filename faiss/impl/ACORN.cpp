@@ -1321,7 +1321,6 @@ int hybrid_search_from_candidates(
 
         int num_found = 0;
         bool keep_expanding = true;
-        std::vector<int> pending_ids;
 
         auto push_result = [&](int id, float distance) {
             if (!sel || sel->is_member(id)) {
@@ -1332,6 +1331,43 @@ int hybrid_search_from_candidates(
                 }
             }
             candidates.push(id, distance);
+        };
+
+        auto score_pending = [&](const std::vector<int>& ids) {
+            if (ids.empty()) {
+                return;
+            }
+
+#if defined(_OPENMP)
+            bool use_edgewise = dc_pool && dc_pool->size() > 1 &&
+                    ids.size() >= dc_pool->size() * 2;
+            if (use_edgewise) {
+                int worker_count = static_cast<int>(dc_pool->size());
+                std::vector<float> distances(ids.size());
+
+#pragma omp parallel num_threads(worker_count)
+                {
+                    int tid = omp_get_thread_num();
+                    DistanceComputer& worker = *(*dc_pool)[tid];
+
+#pragma omp for schedule(static)
+                    for (int idx = 0; idx < (int)ids.size(); ++idx) {
+                        distances[idx] = worker(ids[idx]);
+                    }
+                }
+
+                ndis += ids.size();
+                for (size_t idx = 0; idx < ids.size(); ++idx) {
+                    push_result(ids[idx], distances[idx]);
+                }
+                return;
+            }
+#endif
+
+            ndis += ids.size();
+            for (int id : ids) {
+                push_result(id, qdis(id));
+            }
         };
 
         for (size_t j = begin; j < end; j++) {
@@ -1350,7 +1386,8 @@ int hybrid_search_from_candidates(
 
             if (filter_map[v1]) {
                 vt.set(v1);
-                pending_ids.push_back(v1);
+                ndis++;
+                push_result(v1, qdis(v1));
 
                 if (num_found >= hnsw.M * 2) {
                     keep_expanding = false;
@@ -1361,6 +1398,7 @@ int hybrid_search_from_candidates(
             if ((((int)(j - begin) >= hnsw.M_beta) && keep_expanding) ||
                 hnsw.gamma == 1) {
                 size_t begin2, end2;
+                std::vector<int> second_hop_hits;
                 hnsw.neighbor_range(v1, level, &begin2, &end2);
                 for (size_t j2 = begin2; j2 < end2; j2 += 1) {
                     auto v2 = hnsw.neighbors[j2];
@@ -1380,48 +1418,15 @@ int hybrid_search_from_candidates(
                     }
 
                     vt.set(v2);
-                    pending_ids.push_back(v2);
+                    second_hop_hits.push_back(v2);
                     if (num_found >= hnsw.M * 2) {
                         keep_expanding = false;
                         break;
                     }
                 }
+
+                score_pending(second_hop_hits);
             }
-        }
-
-        bool use_edgewise = dc_pool && dc_pool->size() > 1 &&
-                pending_ids.size() >= dc_pool->size() * 2;
-
-#if defined(_OPENMP)
-        if (use_edgewise) {
-            int worker_count = static_cast<int>(dc_pool->size());
-            std::vector<float> pending_distances(pending_ids.size());
-
-#pragma omp parallel num_threads(worker_count)
-            {
-                int tid = omp_get_thread_num();
-                DistanceComputer& worker = *(*dc_pool)[tid];
-
-#pragma omp for schedule(static)
-                for (int idx = 0; idx < (int)pending_ids.size(); ++idx) {
-                    int id = pending_ids[idx];
-                    pending_distances[idx] = worker(id);
-                }
-            }
-
-            ndis += pending_ids.size();
-            for (size_t idx = 0; idx < pending_ids.size(); ++idx) {
-                push_result(pending_ids[idx], pending_distances[idx]);
-            }
-            return;
-        }
-#endif
-
-        ndis += pending_ids.size();
-        for (size_t idx = 0; idx < pending_ids.size(); ++idx) {
-            int id = pending_ids[idx];
-            float distance = qdis(id);
-            push_result(id, distance);
         }
     };
 
@@ -1649,7 +1654,8 @@ ACORNStats ACORN::hybrid_search(
                     stats,
                     0,
                     0,
-                    params);
+                    params,
+                    dc_pool);
             
 
         } else {
@@ -1698,7 +1704,8 @@ ACORNStats ACORN::hybrid_search(
                         stats,
                         0,
                         0,
-                        params);
+                        params,
+                        dc_pool);
             
                 
             } else {
@@ -1717,7 +1724,8 @@ ACORNStats ACORN::hybrid_search(
                         stats,
                         level,
                         0,
-                        params);
+                        params,
+                        dc_pool);
             }
             vt.advance();
         }
