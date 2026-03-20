@@ -1381,10 +1381,13 @@ int hybrid_search_from_candidates(
             }
 
 #if defined(_OPENMP)
-            bool use_edgewise = dc_pool && dc_pool->size() > 1 &&
-                    ids.size() >= 2;
+            int worker_count = dc_pool
+                    ? std::min<int>(
+                              static_cast<int>(dc_pool->size()),
+                              static_cast<int>(ids.size()))
+                    : 0;
+            bool use_edgewise = worker_count >= 2;
             if (use_edgewise) {
-                int worker_count = static_cast<int>(dc_pool->size());
                 std::vector<float> distances(ids.size());
 
                 if (trace_expansion) {
