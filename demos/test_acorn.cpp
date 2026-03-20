@@ -31,6 +31,7 @@
 #include <sstream>      // for ostringstream
 #include <fstream>  
 #include <iosfwd>
+#include <memory>
 #include <faiss/impl/platform_macros.h>
 #include <assert.h>     /* assert */
 #include <thread>
@@ -157,130 +158,151 @@ int main(int argc, char *argv[]) {
         printf("[%.3f s] Loaded ground truth, gt_size: %d\n", elapsed() - t0, gt_size);
     }
 
+    auto path_exists = [](const std::string& path) {
+        struct stat st;
+        return stat(path.c_str(), &st) == 0;
+    };
+
+    auto ensure_dir = [&](const std::string& path) {
+        if (!path.empty() && !path_exists(path)) {
+            mkdir(path.c_str(), 0777);
+        }
+    };
+
+    std::string tmp_dir = "./tmp";
+    ensure_dir(tmp_dir);
+    if (!(dataset == "sift1M" || dataset == "sift1B")) {
+        ensure_dir(tmp_dir + "/" + dataset);
+    }
+
+    std::stringstream hybrid_path_stream;
+    if (dataset == "sift1M" || dataset == "sift1B") {
+        hybrid_path_stream << "./tmp/hybrid_" << (int)(N / 1000 / 1000)
+                           << "m_nc=" << n_centroids
+                           << "_assignment=" << assignment_type
+                           << "_alpha=" << alpha << ".json";
+    } else {
+        hybrid_path_stream << "./tmp/" << dataset << "/hybrid"
+                           << "_M=" << M << "_efc" << efc
+                           << "_Mb=" << M_beta << "_gamma=" << gamma << ".json";
+    }
+    std::string hybrid_path = hybrid_path_stream.str();
+
+    std::stringstream hybrid_gamma1_path_stream;
+    if (dataset == "sift1M" || dataset == "sift1B") {
+        hybrid_gamma1_path_stream << "./tmp/hybrid_gamma1_" << (int)(N / 1000 / 1000)
+                                  << "m_nc=" << n_centroids
+                                  << "_assignment=" << assignment_type
+                                  << "_alpha=" << alpha << ".json";
+    } else {
+        hybrid_gamma1_path_stream << "./tmp/" << dataset << "/hybrid"
+                                  << "_M=" << M << "_efc" << efc
+                                  << "_Mb=" << M_beta << "_gamma=" << 1 << ".json";
+    }
+    std::string hybrid_gamma1_path = hybrid_gamma1_path_stream.str();
+
+    std::stringstream base_path_stream;
+    if (dataset == "sift1M" || dataset == "sift1B") {
+        base_path_stream << "./tmp/base_" << (int)(N / 1000 / 1000)
+                         << "m_nc=" << n_centroids
+                         << "_assignment=" << assignment_type
+                         << "_alpha=" << alpha << ".json";
+    } else {
+        base_path_stream << "./tmp/" << dataset << "/base"
+                         << "_M=" << M << "_efc=" << efc << ".json";
+    }
+    std::string base_path = base_path_stream.str();
+
+    bool use_cached_indices =
+            path_exists(base_path) &&
+            path_exists(hybrid_path) &&
+            path_exists(hybrid_gamma1_path);
+
     // create normal (base) and hybrid index
     printf("[%.3f s] Index Params -- d: %ld, M: %d, N: %ld, gamma: %d\n",
                elapsed() - t0, d, M, N, gamma);
-    // base HNSW index
-    faiss::IndexHNSWFlat base_index(d, M, 1); // gamma = 1
-    base_index.hnsw.efConstruction = efc; // default is 40  in HNSW.capp
-    base_index.hnsw.efSearch = efs; // default is 16 in HNSW.capp
-    
-    // ACORN-gamma
-    faiss::IndexACORNFlat hybrid_index(d, M, gamma, metadata, M_beta);
-    hybrid_index.acorn.efSearch = efs; // default is 16 HybridHNSW.capp
-    debug("ACORN index created%s\n", "");
+    std::unique_ptr<faiss::IndexHNSWFlat> base_index;
+    std::unique_ptr<faiss::IndexACORN> hybrid_index;
+    std::unique_ptr<faiss::IndexACORN> hybrid_index_gamma1;
 
+    if (use_cached_indices) {
+        printf("[%.3f s] Cache hit, loading indices from disk\n", elapsed() - t0);
+        base_index.reset(dynamic_cast<faiss::IndexHNSWFlat*>(faiss::read_index(base_path.c_str())));
+        hybrid_index.reset(dynamic_cast<faiss::IndexACORN*>(faiss::read_index(hybrid_path.c_str())));
+        hybrid_index_gamma1.reset(dynamic_cast<faiss::IndexACORN*>(faiss::read_index(hybrid_gamma1_path.c_str())));
+        assert(base_index && "cached base index type mismatch");
+        assert(hybrid_index && "cached hybrid index type mismatch");
+        assert(hybrid_index_gamma1 && "cached hybrid gamma1 index type mismatch");
+        hybrid_index->acorn.metadata = metadata.data();
+        hybrid_index_gamma1->acorn.metadata = metadata.data();
+        printf("[%.3f s] Loaded base index from %s\n", elapsed() - t0, base_path.c_str());
+        printf("[%.3f s] Loaded hybrid index from %s\n", elapsed() - t0, hybrid_path.c_str());
+        printf("[%.3f s] Loaded hybrid_gamma1 index from %s\n", elapsed() - t0, hybrid_gamma1_path.c_str());
+    } else {
+        base_index.reset(new faiss::IndexHNSWFlat(d, M, 1));
+        base_index->hnsw.efConstruction = efc;
+        base_index->hnsw.efSearch = efs;
 
-    // ACORN-1
-    faiss::IndexACORNFlat hybrid_index_gamma1(d, M, 1, metadata, M*2);
-    hybrid_index_gamma1.acorn.efSearch = efs; // default is 16 HybridHNSW.capp
+        hybrid_index.reset(new faiss::IndexACORNFlat(d, M, gamma, metadata, M_beta));
+        hybrid_index->acorn.efSearch = efs;
+        debug("ACORN index created%s\n", "");
 
+        hybrid_index_gamma1.reset(new faiss::IndexACORNFlat(d, M, 1, metadata, M * 2));
+        hybrid_index_gamma1->acorn.efSearch = efs;
 
+        { // populating the database
+            std::cout << "====================Vectors====================\n" << std::endl;
+            printf("[%.3f s] Loading database\n", elapsed() - t0);
 
+            size_t nb, d2;
+            bool is_base = 1;
+            std::string filename = get_file_name(dataset, is_base);
+            float* xb = fvecs_read(filename.c_str(), &d2, &nb);
+            assert(d == d2 || !"dataset does not dim 128 as expected");
+            printf("[%.3f s] Loaded base vectors from file: %s\n", elapsed() - t0, filename.c_str());
 
-    { // populating the database
-        std::cout << "====================Vectors====================\n" << std::endl;
-        // printf("====================Vectors====================\n");
-       
-        printf("[%.3f s] Loading database\n", elapsed() - t0);
+            std::cout << "data loaded, with dim: " << d2 << ", nb=" << nb << std::endl;
+            printf("[%.3f s] Indexing database, size %ld*%ld from max %ld\n",
+                   elapsed() - t0, N, d2, nb);
+            printf("[%.3f s] Adding the vectors to the index\n", elapsed() - t0);
 
-        size_t nb, d2;
-        bool is_base = 1;
-        std::string filename = get_file_name(dataset, is_base);
-        float* xb = fvecs_read(filename.c_str(), &d2, &nb);
-        assert(d == d2 || !"dataset does not dim 128 as expected");
-        printf("[%.3f s] Loaded base vectors from file: %s\n", elapsed() - t0, filename.c_str());
+            base_index->add(N, xb);
+            printf("[%.3f s] Vectors added to base index \n", elapsed() - t0);
+            std::cout << "Base index vectors added: " << nb << std::endl;
 
-       
+            hybrid_index->add(N, xb);
+            printf("[%.3f s] Vectors added to hybrid index \n", elapsed() - t0);
+            std::cout << "Hybrid index vectors added" << nb << std::endl;
 
-        std::cout << "data loaded, with dim: " << d2 << ", nb=" << nb << std::endl;
+            hybrid_index_gamma1->add(N, xb);
+            printf("[%.3f s] Vectors added to hybrid index with gamma=1 \n", elapsed() - t0);
+            std::cout << "Hybrid index with gamma=1 vectors added" << nb << std::endl;
 
-        printf("[%.3f s] Indexing database, size %ld*%ld from max %ld\n",
-               elapsed() - t0, N, d2, nb);
-
-        // index->add(nb, xb);
-
-        printf("[%.3f s] Adding the vectors to the index\n", elapsed() - t0);
-        
-        base_index.add(N, xb);
-        printf("[%.3f s] Vectors added to base index \n", elapsed() - t0);
-        std::cout << "Base index vectors added: " << nb << std::endl;
-
-        hybrid_index.add(N, xb);
-        printf("[%.3f s] Vectors added to hybrid index \n", elapsed() - t0);
-        std::cout << "Hybrid index vectors added" << nb << std::endl;
-        // printf("SKIPPED creating ACORN-gamma\n");
-
-
-        hybrid_index_gamma1.add(N, xb);
-        printf("[%.3f s] Vectors added to hybrid index with gamma=1 \n", elapsed() - t0);
-        std::cout << "Hybrid index with gamma=1 vectors added" << nb << std::endl;
-
-    
-
-        delete[] xb;       
-    }
-   
-
-   // write hybrid index and partition indices to files
-    {
-        std::cout << "====================Write Index====================\n" << std::endl;
-        // write hybrid index
-        // std::string filename = "hybrid_index" + dataset + ".index";
-        std::stringstream filepath_stream;
-        if (dataset == "sift1M" || dataset == "sift1B") {
-            filepath_stream << "./tmp/hybrid_"  << (int) (N / 1000 / 1000) << "m_nc=" << n_centroids << "_assignment=" << assignment_type << "_alpha=" << alpha << ".json";
-
-        } else {
-            filepath_stream << "./tmp/" << dataset << "/hybrid" << "_M=" << M << "_efc" << efc << "_Mb=" << M_beta << "_gamma=" << gamma << ".json";
+            delete[] xb;
         }
-        std::string filepath = filepath_stream.str();
-        write_index(&hybrid_index, filepath.c_str());
-        printf("[%.3f s] Wrote hybrid index to file: %s\n", elapsed() - t0, filepath.c_str());
-        
-        // write hybrid_gamma1 index
-        std::stringstream filepath_stream2;
-        if (dataset == "sift1M" || dataset == "sift1B") {
-            filepath_stream2 << "./tmp/hybrid_gamma1_"  << (int) (N / 1000 / 1000) << "m_nc=" << n_centroids << "_assignment=" << assignment_type << "_alpha=" << alpha << ".json";
 
-        } else {
-            filepath_stream2 << "./tmp/" << dataset << "/hybrid" << "_M=" << M << "_efc" << efc << "_Mb=" << M_beta << "_gamma=" << 1 << ".json";
+        { // write hybrid index and partition indices to files
+            std::cout << "====================Write Index====================\n" << std::endl;
+            write_index(hybrid_index.get(), hybrid_path.c_str());
+            printf("[%.3f s] Wrote hybrid index to file: %s\n", elapsed() - t0, hybrid_path.c_str());
+
+            write_index(hybrid_index_gamma1.get(), hybrid_gamma1_path.c_str());
+            printf("[%.3f s] Wrote hybrid_gamma1 index to file: %s\n", elapsed() - t0, hybrid_gamma1_path.c_str());
+
+            write_index(base_index.get(), base_path.c_str());
+            printf("[%.3f s] Wrote base index to file: %s\n", elapsed() - t0, base_path.c_str());
         }
-        std::string filepath2 = filepath_stream2.str();
-        write_index(&hybrid_index_gamma1, filepath2.c_str());
-        printf("[%.3f s] Wrote hybrid_gamma1 index to file: %s\n", elapsed() - t0, filepath2.c_str());
-
-        
-        { // write base index
-            std::stringstream filepath_stream;
-            if (dataset == "sift1M" || dataset == "sift1B") {
-                filepath_stream << "./tmp/base_"  << (int) (N / 1000 / 1000) << "m_nc=" << n_centroids << "_assignment=" << assignment_type << "_alpha=" << alpha << ".json";
-
-            } else {
-                filepath_stream << "./tmp/" << dataset << "/base" << "_M=" << M << "_efc=" << efc << ".json";
-            }
-            std::string filepath = filepath_stream.str();
-            write_index(&base_index, filepath.c_str());
-            printf("[%.3f s] Wrote base index to file: %s\n", elapsed() - t0, filepath.c_str());
-        }
-      
-
-        
-        
-
-
-        
     }
 
     { // print out stats
         printf("====================================\n");
         printf("============ BASE INDEX =============\n");
         printf("====================================\n");
-        base_index.printStats(false);
+        base_index->printStats(false);
         printf("====================================\n");
         printf("============ ACORN INDEX =============\n");
         printf("====================================\n");
-        hybrid_index.printStats(false);
+        hybrid_index->printStats(false);
        
     }
 
@@ -299,9 +321,9 @@ int main(int argc, char *argv[]) {
         printf("[%.3f s] Searching the %d nearest neighbors "
                "of %ld vectors in the index, efsearch %d\n",
                elapsed() - t0,
-               k,
-               nq,
-               base_index.hnsw.efSearch);
+                k,
+                nq,
+                base_index->hnsw.efSearch);
 
         std::vector<faiss::idx_t> nns(k * nq);
         std::vector<float> dis(k * nq);
@@ -312,7 +334,7 @@ int main(int argc, char *argv[]) {
  
 
         double t1 = elapsed();
-        base_index.search(nq, xq, k, dis.data(), nns.data());
+        base_index->search(nq, xq, k, dis.data(), nns.data());
         double t2 = elapsed();
 
         printf("[%.3f s] Query results (vector ids, then distances):\n",
@@ -367,9 +389,9 @@ int main(int argc, char *argv[]) {
         printf("[%.3f s] Searching the %d nearest neighbors "
                "of %ld vectors in the index, efsearch %d\n",
                elapsed() - t0,
-               k,
-               nq,
-               hybrid_index.acorn.efSearch);
+                k,
+                nq,
+                hybrid_index->acorn.efSearch);
 
         std::vector<faiss::idx_t> nns2(k * nq);
         std::vector<float> dis2(k * nq);
@@ -383,7 +405,7 @@ int main(int argc, char *argv[]) {
         }
 
         double t1_x = elapsed();
-        hybrid_index.search(nq, xq, k, dis2.data(), nns2.data(), filter_ids_map.data()); // TODO change first argument back to nq
+        hybrid_index->search(nq, xq, k, dis2.data(), nns2.data(), filter_ids_map.data()); // TODO change first argument back to nq
         double t2_x = elapsed();
 
 
