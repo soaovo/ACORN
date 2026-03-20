@@ -1382,7 +1382,7 @@ int hybrid_search_from_candidates(
 
 #if defined(_OPENMP)
             bool use_edgewise = dc_pool && dc_pool->size() > 1 &&
-                    ids.size() >= dc_pool->size() * 2;
+                    ids.size() >= 2;
             if (use_edgewise) {
                 int worker_count = static_cast<int>(dc_pool->size());
                 std::vector<float> distances(ids.size());
