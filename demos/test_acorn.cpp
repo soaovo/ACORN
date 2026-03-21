@@ -62,6 +62,7 @@ int main(int argc, char *argv[]) {
     // int gamma = (int) 1 / attr_sel;
     int gamma;
     int n_centroids;
+    int pathwise_width = 1;
     // int filter = 0;
     std::string dataset; // must be sift1B or sift1M or tripclick
     int test_partitions = 0;
@@ -79,8 +80,8 @@ int main(int argc, char *argv[]) {
     int opt;
     {// parse arguments
 
-        if (argc < 6 || argc > 8) {
-            fprintf(stderr, "Syntax: %s <number vecs> <gamma> [<assignment_type>] [<alpha>] <dataset> <M> <M_beta>\n", argv[0]);
+        if (argc < 6 || argc > 7) {
+            fprintf(stderr, "Syntax: %s <number vecs> <gamma> <dataset> <M> <M_beta> [<pathwise_width>]\n", argv[0]);
             exit(1);
         }
 
@@ -107,6 +108,15 @@ int main(int argc, char *argv[]) {
 
         M_beta = atoi(argv[5]);
         printf("M_beta: %d\n", M_beta);
+
+        if (argc == 7) {
+            pathwise_width = atoi(argv[6]);
+            if (pathwise_width < 1) {
+                fprintf(stderr, "Invalid <pathwise_width>; must be >= 1\n");
+                exit(1);
+            }
+        }
+        printf("pathwise_width: %d\n", pathwise_width);
 
     }
     
@@ -404,8 +414,18 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        faiss::SearchParametersACORN search_params;
+        search_params.pathwise_width = pathwise_width;
+
         double t1_x = elapsed();
-        hybrid_index->search(nq, xq, k, dis2.data(), nns2.data(), filter_ids_map.data()); // TODO change first argument back to nq
+        hybrid_index->search(
+                nq,
+                xq,
+                k,
+                dis2.data(),
+                nns2.data(),
+                filter_ids_map.data(),
+                &search_params);
         double t2_x = elapsed();
 
 
