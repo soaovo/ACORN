@@ -1329,6 +1329,17 @@ int hybrid_search_from_candidates(
                                 : std::max(1, hnsw.pathwise_width);
     const IDSelector* sel = params ? params->sel : nullptr;
 
+    struct ReplayBatch {
+        const char* hop;
+        std::vector<int> ids;
+    };
+
+    struct FrontierExpansion {
+        int v0;
+        bool trace_expansion;
+        std::vector<ReplayBatch> batches;
+    };
+
     for (int i = 0; i < candidates.size(); i++) {
         idx_t v1 = candidates.ids[i];
         float d = candidates.dis[i];
@@ -1343,7 +1354,102 @@ int hybrid_search_from_candidates(
         vt.set(v1);
     }
 
-    auto expand_candidate = [&](int v0) {
+    auto replay_batch = [&](const ReplayBatch& batch, bool trace_expansion) {
+        const std::vector<int>& ids = batch.ids;
+        if (ids.empty()) {
+            return;
+        }
+
+#if defined(_OPENMP)
+        int worker_count = dc_pool
+                ? std::min<int>(
+                          static_cast<int>(dc_pool->size()),
+                          static_cast<int>(ids.size()))
+                : 0;
+        bool use_edgewise = worker_count >= 2;
+        if (use_edgewise) {
+            std::vector<float> distances(ids.size());
+
+            if (trace_expansion) {
+                hybrid_debug_log(
+                        "  [hybrid-debug q=%d] %s batch=%zu edgewise=1 workers=%d\n",
+                        hybridDebugActiveQuery,
+                        batch.hop,
+                        ids.size(),
+                        worker_count);
+            }
+
+#pragma omp parallel num_threads(worker_count)
+            {
+                int tid = omp_get_thread_num();
+                DistanceComputer& worker = *(*dc_pool)[tid];
+
+#pragma omp for schedule(static)
+                for (int idx = 0; idx < (int)ids.size(); ++idx) {
+                    distances[idx] = worker(ids[idx]);
+                }
+            }
+
+            ndis += ids.size();
+            for (size_t idx = 0; idx < ids.size(); ++idx) {
+                int id = ids[idx];
+                float distance = distances[idx];
+                if (!sel || sel->is_member(id)) {
+                    if (nres < k) {
+                        faiss::maxheap_push(++nres, D, I, distance, id);
+                    } else if (distance < D[0]) {
+                        faiss::maxheap_replace_top(nres, D, I, distance, id);
+                    }
+                }
+                candidates.push(id, distance);
+                if (trace_expansion) {
+                    hybrid_debug_log(
+                            "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
+                            hybridDebugActiveQuery,
+                            batch.hop,
+                            id,
+                            distance,
+                            nres,
+                            candidates.size());
+                }
+            }
+            return;
+        }
+#endif
+
+        if (trace_expansion) {
+            hybrid_debug_log(
+                    "  [hybrid-debug q=%d] %s batch=%zu edgewise=0\n",
+                    hybridDebugActiveQuery,
+                    batch.hop,
+                    ids.size());
+        }
+
+        ndis += ids.size();
+        for (int id : ids) {
+            float distance = qdis(id);
+            if (!sel || sel->is_member(id)) {
+                if (nres < k) {
+                    faiss::maxheap_push(++nres, D, I, distance, id);
+                } else if (distance < D[0]) {
+                    faiss::maxheap_replace_top(nres, D, I, distance, id);
+                }
+            }
+            candidates.push(id, distance);
+            if (trace_expansion) {
+                hybrid_debug_log(
+                        "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
+                        hybridDebugActiveQuery,
+                        batch.hop,
+                        id,
+                        distance,
+                        nres,
+                        candidates.size());
+            }
+        }
+    };
+
+    auto collect_expansion = [&](int v0) {
         size_t begin, end;
         hnsw.neighbor_range(v0, level, &begin, &end);
 
@@ -1351,6 +1457,7 @@ int hybrid_search_from_candidates(
         bool keep_expanding = true;
         bool trace_expansion = hybridDebugEnabled &&
                 hybridDebugExpansionCount < hybridDebugExpansionLimit;
+        FrontierExpansion expansion{v0, trace_expansion, {}};
 
         if (trace_expansion) {
             hybrid_debug_log(
@@ -1363,95 +1470,6 @@ int hybrid_search_from_candidates(
                     end - begin);
             hybridDebugExpansionCount++;
         }
-
-        auto push_result = [&](int id, float distance) {
-            if (!sel || sel->is_member(id)) {
-                if (nres < k) {
-                    faiss::maxheap_push(++nres, D, I, distance, id);
-                } else if (distance < D[0]) {
-                    faiss::maxheap_replace_top(nres, D, I, distance, id);
-                }
-            }
-            candidates.push(id, distance);
-        };
-
-        auto score_pending = [&](const std::vector<int>& ids, const char* hop) {
-            if (ids.empty()) {
-                return;
-            }
-
-#if defined(_OPENMP)
-            int worker_count = dc_pool
-                    ? std::min<int>(
-                              static_cast<int>(dc_pool->size()),
-                              static_cast<int>(ids.size()))
-                    : 0;
-            bool use_edgewise = worker_count >= 2;
-            if (use_edgewise) {
-                std::vector<float> distances(ids.size());
-
-                if (trace_expansion) {
-                    hybrid_debug_log(
-                            "  [hybrid-debug q=%d] %s batch=%zu edgewise=1 workers=%d\n",
-                            hybridDebugActiveQuery,
-                            hop,
-                            ids.size(),
-                            worker_count);
-                }
-
-#pragma omp parallel num_threads(worker_count)
-                {
-                    int tid = omp_get_thread_num();
-                    DistanceComputer& worker = *(*dc_pool)[tid];
-
-#pragma omp for schedule(static)
-                    for (int idx = 0; idx < (int)ids.size(); ++idx) {
-                        distances[idx] = worker(ids[idx]);
-                    }
-                }
-
-                ndis += ids.size();
-                for (size_t idx = 0; idx < ids.size(); ++idx) {
-                    push_result(ids[idx], distances[idx]);
-                    if (trace_expansion) {
-                        hybrid_debug_log(
-                                "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
-                                hybridDebugActiveQuery,
-                                hop,
-                                ids[idx],
-                                distances[idx],
-                                nres,
-                                candidates.size());
-                    }
-                }
-                return;
-            }
-#endif
-
-            if (trace_expansion) {
-                hybrid_debug_log(
-                        "  [hybrid-debug q=%d] %s batch=%zu edgewise=0\n",
-                        hybridDebugActiveQuery,
-                        hop,
-                        ids.size());
-            }
-
-            ndis += ids.size();
-            for (int id : ids) {
-                float distance = qdis(id);
-                push_result(id, distance);
-                if (trace_expansion) {
-                    hybrid_debug_log(
-                            "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
-                            hybridDebugActiveQuery,
-                            hop,
-                            id,
-                            distance,
-                            nres,
-                            candidates.size());
-                }
-            }
-        };
 
         for (size_t j = begin; j < end; j++) {
             auto v1 = hnsw.neighbors[j];
@@ -1477,18 +1495,13 @@ int hybrid_search_from_candidates(
 
             if (filter_map[v1]) {
                 vt.set(v1);
-                ndis++;
-                float distance = qdis(v1);
-                push_result(v1, distance);
+                expansion.batches.push_back({"L1", {v1}});
                 if (trace_expansion) {
                     hybrid_debug_log(
-                            "  [hybrid-debug q=%d] L1 push id=%d dis=%g num_found=%d nres=%d cand=%d\n",
+                            "  [hybrid-debug q=%d] L1 collect id=%d num_found=%d\n",
                             hybridDebugActiveQuery,
                             v1,
-                            distance,
-                            num_found,
-                            nres,
-                            candidates.size());
+                            num_found);
                 }
 
                 if (num_found >= hnsw.M * 2) {
@@ -1556,17 +1569,32 @@ int hybrid_search_from_candidates(
                     }
                 }
 
-                score_pending(second_hop_hits, "L2");
+                if (!second_hop_hits.empty()) {
+                    expansion.batches.push_back({"L2", std::move(second_hop_hits)});
+                }
             }
         }
+
+        return expansion;
     };
 
     int nstep = 0;
     bool should_stop = false;
 
     while (candidates.size() > 0 && !should_stop) {
-        int expanded = 0;
-        while (expanded < pathwise_width && candidates.size() > 0) {
+        int frontier_capacity = pathwise_width;
+        if (!do_dis_check) {
+            frontier_capacity =
+                    std::min(pathwise_width, std::max(0, efSearch - nstep + 1));
+        }
+        if (frontier_capacity <= 0) {
+            break;
+        }
+
+        std::vector<FrontierExpansion> frontier;
+        frontier.reserve(frontier_capacity);
+
+        while ((int)frontier.size() < frontier_capacity && candidates.size() > 0) {
             float d0 = 0;
             int v0 = candidates.pop_min(&d0);
 
@@ -1588,13 +1616,19 @@ int hybrid_search_from_candidates(
                 }
             }
 
-            expand_candidate(v0);
+            frontier.push_back(collect_expansion(v0));
+        }
+
+        for (const FrontierExpansion& expansion : frontier) {
+            for (const ReplayBatch& batch : expansion.batches) {
+                replay_batch(batch, expansion.trace_expansion);
+            }
 
             if (hybridDebugEnabled) {
                 hybrid_debug_log(
                         "[hybrid-debug q=%d] post-expand v0=%d queue=%d nres=%d ndis=%d\n",
                         hybridDebugActiveQuery,
-                        v0,
+                        expansion.v0,
                         candidates.size(),
                         nres,
                         ndis);
@@ -1605,8 +1639,6 @@ int hybrid_search_from_candidates(
                 should_stop = true;
                 break;
             }
-
-            expanded++;
         }
     }
 
