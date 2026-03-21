@@ -25,6 +25,7 @@
 #include <iostream>
 #include <math.h>  
 #include <unordered_map>
+#include <unordered_set>
 #include <iostream>
 #include <fstream>
 /*******************************************************
@@ -1340,6 +1341,9 @@ int hybrid_search_from_candidates(
         std::vector<ReplayBatch> batches;
     };
 
+    std::unordered_set<int> frontier_seen;
+    frontier_seen.reserve(std::max(8, pathwise_width * std::max(1, hnsw.M * 2)));
+
     for (int i = 0; i < candidates.size(); i++) {
         idx_t v1 = candidates.ids[i];
         float d = candidates.dis[i];
@@ -1355,7 +1359,19 @@ int hybrid_search_from_candidates(
     }
 
     auto replay_batch = [&](const ReplayBatch& batch, bool trace_expansion) {
-        const std::vector<int>& ids = batch.ids;
+        if (batch.ids.empty()) {
+            return;
+        }
+
+        std::vector<int> ids;
+        ids.reserve(batch.ids.size());
+        for (int id : batch.ids) {
+            if (vt.get(id)) {
+                continue;
+            }
+            vt.set(id);
+            ids.push_back(id);
+        }
         if (ids.empty()) {
             return;
         }
@@ -1494,14 +1510,15 @@ int hybrid_search_from_candidates(
             }
 
             if (filter_map[v1]) {
-                vt.set(v1);
-                expansion.batches.push_back({"L1", {v1}});
-                if (trace_expansion) {
-                    hybrid_debug_log(
-                            "  [hybrid-debug q=%d] L1 collect id=%d num_found=%d\n",
-                            hybridDebugActiveQuery,
-                            v1,
-                            num_found);
+                if (frontier_seen.insert(v1).second) {
+                    expansion.batches.push_back({"L1", {v1}});
+                    if (trace_expansion) {
+                        hybrid_debug_log(
+                                "  [hybrid-debug q=%d] L1 collect id=%d num_found=%d\n",
+                                hybridDebugActiveQuery,
+                                v1,
+                                num_found);
+                    }
                 }
 
                 if (num_found >= hnsw.M * 2) {
@@ -1554,8 +1571,9 @@ int hybrid_search_from_candidates(
                         continue;
                     }
 
-                    vt.set(v2);
-                    second_hop_hits.push_back(v2);
+                    if (frontier_seen.insert(v2).second) {
+                        second_hop_hits.push_back(v2);
+                    }
                     if (num_found >= hnsw.M * 2) {
                         keep_expanding = false;
                         if (trace_expansion) {
@@ -1593,6 +1611,7 @@ int hybrid_search_from_candidates(
 
         std::vector<FrontierExpansion> frontier;
         frontier.reserve(frontier_capacity);
+        frontier_seen.clear();
 
         while ((int)frontier.size() < frontier_capacity && candidates.size() > 0) {
             float d0 = 0;

@@ -335,6 +335,9 @@ void IndexACORN::search(
             VisitedTable vt(ntotal);
 
             int edgewise_nt = default_edgewise_nt;
+            if (omp_in_parallel() && omp_get_num_threads() > 1) {
+                edgewise_nt = 1;
+            }
             std::vector<std::unique_ptr<DistanceComputer>> dc_storage(edgewise_nt);
             std::vector<DistanceComputer*> dc_raw;
             if (edgewise_nt > 1) {
@@ -439,6 +442,9 @@ void IndexACORN::search(
             VisitedTable vt(ntotal);
 
             int edgewise_nt = default_edgewise_nt;
+            if (omp_in_parallel() && omp_get_num_threads() > 1) {
+                edgewise_nt = 1;
+            }
             std::vector<std::unique_ptr<DistanceComputer>> dc_storage(edgewise_nt);
             std::vector<DistanceComputer*> dc_raw;
             if (edgewise_nt > 1) {
