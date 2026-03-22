@@ -1139,6 +1139,12 @@ struct PathwiseSchedule {
     bool staged;
 };
 
+struct FrontierNode {
+    int id;
+    float distance;
+    int queue_size_after_pop;
+};
+
 PathwiseSchedule resolve_pathwise_schedule(
         const ACORN& hnsw,
         const SearchParametersACORN* params) {
@@ -1182,6 +1188,56 @@ int pathwise_width_for_step(const PathwiseSchedule& schedule, int step) {
         }
     }
     return std::min(width, schedule.max_width);
+}
+
+template <typename ConsumeFrontier, typename OnDistanceStop>
+void run_pathwise_frontier_loop(
+        MinimaxHeap& candidates,
+        const PathwiseSchedule& pathwise,
+        bool do_dis_check,
+        int efSearch,
+        int& nstep,
+        bool& should_stop,
+        ConsumeFrontier&& consume_frontier,
+        OnDistanceStop&& on_distance_stop) {
+    while (candidates.size() > 0 && !should_stop) {
+        int frontier_capacity = pathwise_width_for_step(pathwise, nstep);
+        if (!do_dis_check) {
+            frontier_capacity =
+                    std::min(frontier_capacity, std::max(0, efSearch - nstep + 1));
+        }
+        if (frontier_capacity <= 0) {
+            break;
+        }
+
+        std::vector<FrontierNode> frontier;
+        frontier.reserve(frontier_capacity);
+
+        while ((int)frontier.size() < frontier_capacity && candidates.size() > 0) {
+            float d0 = 0;
+            int v0 = candidates.pop_min(&d0);
+
+            if (do_dis_check) {
+                int n_dis_below = candidates.count_below(d0);
+                if (n_dis_below >= efSearch) {
+                    on_distance_stop(d0, n_dis_below);
+                    should_stop = true;
+                    break;
+                }
+            }
+
+            frontier.push_back({v0, d0, candidates.size()});
+        }
+
+        if (frontier.empty()) {
+            continue;
+        }
+
+        nstep += consume_frontier(frontier);
+        if (!do_dis_check && nstep > efSearch) {
+            should_stop = true;
+        }
+    }
 }
 
 /** Do a BFS on the candidates list */
@@ -1317,33 +1373,20 @@ int search_from_candidates(
 
     int nstep = 0;
     bool should_stop = false;
-
-    while (candidates.size() > 0 && !should_stop) {
-        int current_pathwise_width = pathwise_width_for_step(pathwise, nstep);
-        int expanded = 0;
-        while (expanded < current_pathwise_width && candidates.size() > 0) {
-            float d0 = 0;
-            int v0 = candidates.pop_min(&d0);
-
-            if (do_dis_check) {
-                int n_dis_below = candidates.count_below(d0);
-                if (n_dis_below >= efSearch) {
-                    should_stop = true;
-                    break;
+    run_pathwise_frontier_loop(
+            candidates,
+            pathwise,
+            do_dis_check,
+            efSearch,
+            nstep,
+            should_stop,
+            [&](const std::vector<FrontierNode>& frontier) {
+                for (const FrontierNode& node : frontier) {
+                    expand_candidate(node.id);
                 }
-            }
-
-            expand_candidate(v0);
-
-            nstep++;
-            if (!do_dis_check && nstep > efSearch) {
-                should_stop = true;
-                break;
-            }
-
-            expanded++;
-        }
-    }
+                return static_cast<int>(frontier.size());
+            },
+            [&](float, int) {});
 
     if (level == 0) {
         stats.n1++;
@@ -1523,7 +1566,8 @@ int hybrid_search_from_candidates(
         }
     };
 
-    auto collect_expansion = [&](int v0) {
+    auto collect_expansion = [&](const FrontierNode& node) {
+        int v0 = node.id;
         size_t begin, end;
         hnsw.neighbor_range(v0, level, &begin, &end);
 
@@ -1539,7 +1583,7 @@ int hybrid_search_from_candidates(
                     hybridDebugActiveQuery,
                     hybridDebugExpansionCount,
                     v0,
-                    candidates.size(),
+                    node.queue_size_after_pop,
                     nres,
                     end - begin);
             hybridDebugExpansionCount++;
@@ -1656,70 +1700,52 @@ int hybrid_search_from_candidates(
 
     int nstep = 0;
     bool should_stop = false;
+    run_pathwise_frontier_loop(
+            candidates,
+            pathwise,
+            do_dis_check,
+            efSearch,
+            nstep,
+            should_stop,
+            [&](const std::vector<FrontierNode>& frontier_nodes) {
+                std::vector<FrontierExpansion> frontier;
+                frontier.reserve(frontier_nodes.size());
+                frontier_seen.clear();
 
-    while (candidates.size() > 0 && !should_stop) {
-        int frontier_capacity = pathwise_width_for_step(pathwise, nstep);
-        if (!do_dis_check) {
-            frontier_capacity =
-                    std::min(
-                            frontier_capacity,
-                            std::max(0, efSearch - nstep + 1));
-        }
-        if (frontier_capacity <= 0) {
-            break;
-        }
+                for (const FrontierNode& node : frontier_nodes) {
+                    frontier.push_back(collect_expansion(node));
+                }
 
-        std::vector<FrontierExpansion> frontier;
-        frontier.reserve(frontier_capacity);
-        frontier_seen.clear();
+                for (const FrontierExpansion& expansion : frontier) {
+                    for (const ReplayBatch& batch : expansion.batches) {
+                        replay_batch(batch, expansion.trace_expansion);
+                    }
 
-        while ((int)frontier.size() < frontier_capacity && candidates.size() > 0) {
-            float d0 = 0;
-            int v0 = candidates.pop_min(&d0);
-
-            if (do_dis_check) {
-                int n_dis_below = candidates.count_below(d0);
-                if (n_dis_below >= efSearch) {
                     if (hybridDebugEnabled) {
                         hybrid_debug_log(
-                                "[hybrid-debug q=%d] stop by dis_check d0=%g below=%d ef=%d queue=%d nres=%d\n",
+                                "[hybrid-debug q=%d] post-expand v0=%d queue=%d nres=%d ndis=%d\n",
                                 hybridDebugActiveQuery,
-                                d0,
-                                n_dis_below,
-                                efSearch,
+                                expansion.v0,
                                 candidates.size(),
-                                nres);
+                                nres,
+                                ndis);
                     }
-                    should_stop = true;
-                    break;
                 }
-            }
 
-            frontier.push_back(collect_expansion(v0));
-        }
-
-        for (const FrontierExpansion& expansion : frontier) {
-            for (const ReplayBatch& batch : expansion.batches) {
-                replay_batch(batch, expansion.trace_expansion);
-            }
-
-            if (hybridDebugEnabled) {
-                hybrid_debug_log(
-                        "[hybrid-debug q=%d] post-expand v0=%d queue=%d nres=%d ndis=%d\n",
-                        hybridDebugActiveQuery,
-                        expansion.v0,
-                        candidates.size(),
-                        nres,
-                        ndis);
-            }
-
-            nstep++;
-            if (!do_dis_check && nstep > efSearch) {
-                should_stop = true;
-                break;
-            }
-        }
-    }
+                return static_cast<int>(frontier.size());
+            },
+            [&](float d0, int n_dis_below) {
+                if (hybridDebugEnabled) {
+                    hybrid_debug_log(
+                            "[hybrid-debug q=%d] stop by dis_check d0=%g below=%d ef=%d queue=%d nres=%d\n",
+                            hybridDebugActiveQuery,
+                            d0,
+                            n_dis_below,
+                            efSearch,
+                            candidates.size(),
+                            nres);
+                }
+            });
 
     if (level == 0) {
         stats.n1++;
