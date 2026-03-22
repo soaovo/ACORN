@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
-import math
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 
@@ -52,7 +52,7 @@ def merge_topk(
         best_i: np.ndarray,
         cand_d: np.ndarray,
         cand_i: np.ndarray,
-        k: int) -> tuple[np.ndarray, np.ndarray]:
+        k: int) -> Tuple[np.ndarray, np.ndarray]:
     all_d = np.hstack((best_d, cand_d))
     all_i = np.hstack((best_i, cand_i))
     pick = np.argpartition(all_d, kth=k - 1, axis=1)[:, :k]
@@ -63,7 +63,7 @@ def merge_topk(
     return new_d[row, order], new_i[row, order]
 
 
-def exact_search_chunk(xq: np.ndarray, xb: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+def exact_search_chunk(xq: np.ndarray, xb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     if faiss is None:
         raise RuntimeError(
             "Python faiss module is required for GT generation. "
