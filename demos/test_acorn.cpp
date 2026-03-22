@@ -66,7 +66,7 @@ int main(int argc, char *argv[]) {
     int pathwise_growth_interval = 4;
     bool pathwise_staged = false;
     // int filter = 0;
-    std::string dataset; // must be sift1B or sift1M or tripclick
+    std::string dataset; // must be sift1B or sift1M or tripclick or custom/custom1B
     int test_partitions = 0;
     int step = 10; //2
     
@@ -102,9 +102,9 @@ int main(int argc, char *argv[]) {
         
         dataset = argv[3];
         printf("dataset: %s\n", dataset.c_str());
-        if (dataset != "sift1M" && dataset != "sift1M_test" && dataset != "sift1B" && dataset != "tripclick" && dataset != "paper" && dataset != "paper_rand2m" && dataset != "custom") {
+        if (dataset != "sift1M" && dataset != "sift1M_test" && dataset != "sift1B" && dataset != "tripclick" && dataset != "paper" && dataset != "paper_rand2m" && dataset != "custom" && dataset != "custom1B") {
             printf("got dataset: %s\n", dataset.c_str());
-            fprintf(stderr, "Invalid <dataset>; must be a value in [sift1M, sift1B]\n");
+            fprintf(stderr, "Invalid <dataset>; must be a value in [sift1M, sift1B, custom, custom1B]\n");
             exit(1);
         }
 

@@ -50,6 +50,12 @@ static const std::string CUSTOM_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata
 static const std::string CUSTOM_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta.txt";
 static const std::string CUSTOM_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth.ivecs";
 
+static const std::string CUSTOM1B_BASE = "/SSD/SIFT1M/sift_base.fvecs";
+static const std::string CUSTOM1B_QUERY = "/SSD/SIFT1M/sift_query.fvecs";
+static const std::string CUSTOM1B_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata.txt";
+static const std::string CUSTOM1B_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta.txt";
+static const std::string CUSTOM1B_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth.ivecs";
+
 std::vector<int> load_ints_from_txt(const std::string& path) {
     std::ifstream fin(path);
     if (!fin.is_open()) throw std::runtime_error("Cannot open " + path);
@@ -57,6 +63,30 @@ std::vector<int> load_ints_from_txt(const std::string& path) {
     int x;
     while (fin >> x) vals.push_back(x);
     return vals;
+}
+
+bool is_custom_dataset(const std::string& dataset) {
+    return dataset == "custom" || dataset == "custom1B";
+}
+
+const std::string& custom_base_path(const std::string& dataset) {
+    return dataset == "custom1B" ? CUSTOM1B_BASE : CUSTOM_BASE;
+}
+
+const std::string& custom_query_path(const std::string& dataset) {
+    return dataset == "custom1B" ? CUSTOM1B_QUERY : CUSTOM_QUERY;
+}
+
+const std::string& custom_base_meta_path(const std::string& dataset) {
+    return dataset == "custom1B" ? CUSTOM1B_BASE_META : CUSTOM_BASE_META;
+}
+
+const std::string& custom_query_meta_path(const std::string& dataset) {
+    return dataset == "custom1B" ? CUSTOM1B_QUERY_META : CUSTOM_QUERY_META;
+}
+
+const std::string& custom_gt_path(const std::string& dataset) {
+    return dataset == "custom1B" ? CUSTOM1B_GT : CUSTOM_GT;
 }
 
 
@@ -141,9 +171,9 @@ int* ivecs_read(const char* fname, size_t* d_out, size_t* n_out) {
 
 // get file name to load data vectors from
 std::string get_file_name(std::string dataset, bool is_base) {
-    if (dataset == "custom") {
-    return is_base ? CUSTOM_BASE : CUSTOM_QUERY;
-} else if (dataset == "sift1M" || dataset == "sift1M_test") {
+    if (is_custom_dataset(dataset)) {
+        return is_base ? custom_base_path(dataset) : custom_query_path(dataset);
+    } else if (dataset == "sift1M" || dataset == "sift1M_test") {
         return std::string("./Datasets/sift1M/sift_") + (is_base ? "base" : "query") + ".fvecs";
     } else if (dataset == "sift1B") {
         return std::string("./Datasets/sift1B/bigann_") + (is_base ? "base_10m" : "query") + ".fvecs";
@@ -332,9 +362,9 @@ std::vector<T> load_json_to_vector(std::string filepath) {
 
 
 std::vector<int> load_aq(std::string dataset, int n_centroids, int alpha, int N) {
-    if (dataset == "custom") {
-    return load_ints_from_txt(CUSTOM_QUERY_META);
-}
+    if (is_custom_dataset(dataset)) {
+        return load_ints_from_txt(custom_query_meta_path(dataset));
+    }
 
     else if (dataset == "sift1M" || dataset == "sift1B") {
         assert((alpha == -2 || alpha == 0 || alpha == 2) || !"alpha must be value in [-2, 0, 2]");
@@ -403,8 +433,8 @@ std::vector<int> load_aq(std::string dataset, int n_centroids, int alpha, int N)
 // assignment_type can be "rand", "soft", "soft_squared", "hard"
 std::vector<int> load_ab(std::string dataset, int n_centroids, std::string assignment_type, int N) {
     // Compose File Name
-    if (dataset == "custom") {
-        auto vals = load_ints_from_txt(CUSTOM_BASE_META);
+    if (is_custom_dataset(dataset)) {
+        auto vals = load_ints_from_txt(custom_base_meta_path(dataset));
         if ((int)vals.size() > N) vals.resize(N);
         return vals;
     }
@@ -484,13 +514,13 @@ std::vector<int> load_ab(std::string dataset, int n_centroids, std::string assig
 // assignment_type can be "rand", "soft", "soft_squared", "hard"
 // alpha can be -2, 0, 2
 std::vector<faiss::idx_t> load_gt(std::string dataset, int n_centroids, int alpha, std::string assignment_type, int N) {
-    if (dataset == "custom") {
-    size_t d, nq;
-    int* data = ivecs_read(CUSTOM_GT.c_str(), &d, &nq);
-    std::vector<faiss::idx_t> gt(data, data + d * nq);
-    delete[] data;
-    return gt;
-}
+    if (is_custom_dataset(dataset)) {
+        size_t d, nq;
+        int* data = ivecs_read(custom_gt_path(dataset).c_str(), &d, &nq);
+        std::vector<faiss::idx_t> gt(data, data + d * nq);
+        delete[] data;
+        return gt;
+    }
 
     else if (dataset == "sift1M" || dataset == "sift1B") {
         // Compose File Name
