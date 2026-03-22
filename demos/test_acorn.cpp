@@ -63,6 +63,8 @@ int main(int argc, char *argv[]) {
     int gamma;
     int n_centroids;
     int pathwise_width = 1;
+    int pathwise_growth_interval = 4;
+    bool pathwise_staged = false;
     // int filter = 0;
     std::string dataset; // must be sift1B or sift1M or tripclick
     int test_partitions = 0;
@@ -80,8 +82,11 @@ int main(int argc, char *argv[]) {
     int opt;
     {// parse arguments
 
-        if (argc < 6 || argc > 7) {
-            fprintf(stderr, "Syntax: %s <number vecs> <gamma> <dataset> <M> <M_beta> [<pathwise_width>]\n", argv[0]);
+        if (argc < 6 || argc > 8) {
+            fprintf(
+                    stderr,
+                    "Syntax: %s <number vecs> <gamma> <dataset> <M> <M_beta> [<pathwise_max_width> [<pathwise_growth_interval>]]\n",
+                    argv[0]);
             exit(1);
         }
 
@@ -109,14 +114,24 @@ int main(int argc, char *argv[]) {
         M_beta = atoi(argv[5]);
         printf("M_beta: %d\n", M_beta);
 
-        if (argc == 7) {
+        if (argc >= 7) {
             pathwise_width = atoi(argv[6]);
             if (pathwise_width < 1) {
                 fprintf(stderr, "Invalid <pathwise_width>; must be >= 1\n");
                 exit(1);
             }
         }
+        if (argc == 8) {
+            pathwise_growth_interval = atoi(argv[7]);
+            if (pathwise_growth_interval < 1) {
+                fprintf(stderr, "Invalid <pathwise_growth_interval>; must be >= 1\n");
+                exit(1);
+            }
+            pathwise_staged = true;
+        }
         printf("pathwise_width: %d\n", pathwise_width);
+        printf("pathwise_staged: %d\n", pathwise_staged ? 1 : 0);
+        printf("pathwise_growth_interval: %d\n", pathwise_growth_interval);
 
     }
     
@@ -416,6 +431,10 @@ int main(int argc, char *argv[]) {
 
         faiss::SearchParametersACORN search_params;
         search_params.pathwise_width = pathwise_width;
+        search_params.pathwise_init_width = 1;
+        search_params.pathwise_max_width = pathwise_width;
+        search_params.pathwise_growth_interval = pathwise_growth_interval;
+        search_params.pathwise_staged = pathwise_staged;
 
         double t1_x = elapsed();
         hybrid_index->search(

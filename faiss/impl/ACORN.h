@@ -40,6 +40,10 @@ struct SearchParametersACORN : SearchParameters {
     int efSearch = 16;
     bool check_relative_distance = true;
     int pathwise_width = 1;
+    int pathwise_init_width = 1;
+    int pathwise_max_width = 1;
+    int pathwise_growth_interval = 4;
+    bool pathwise_staged = false;
     int edgewise_nt = 0; // 0 -> use omp_get_max_threads()
 
     ~SearchParametersACORN() {}
@@ -145,6 +149,12 @@ struct ACORN {
 
     /// number of candidates expanded together (path-wise width)
     int pathwise_width;
+
+    /// staged path-wise expansion configuration
+    int pathwise_init_width;
+    int pathwise_max_width;
+    int pathwise_growth_interval;
+    bool pathwise_staged;
 
     /// during search: do we check whether the next best distance is good
     /// enough?

@@ -157,6 +157,10 @@ ACORN::ACORN(int M, int gamma, std::vector<int>& metadata, int M_beta) : rng(123
     entry_point = -1;
     efSearch = 16;
     pathwise_width = 1;
+    pathwise_init_width = 1;
+    pathwise_max_width = 1;
+    pathwise_growth_interval = 4;
+    pathwise_staged = false;
     efConstruction = M * gamma; //added gamma
     upper_beam = 1;
     this->gamma = gamma;
@@ -1126,6 +1130,60 @@ namespace {
 using MinimaxHeap = ACORN::MinimaxHeap;
 using Node = ACORN::Node;
 using NeighNode = ACORN::NeighNode;
+
+struct PathwiseSchedule {
+    int fixed_width;
+    int init_width;
+    int max_width;
+    int growth_interval;
+    bool staged;
+};
+
+PathwiseSchedule resolve_pathwise_schedule(
+        const ACORN& hnsw,
+        const SearchParametersACORN* params) {
+    PathwiseSchedule schedule;
+    schedule.fixed_width =
+            params ? std::max(1, params->pathwise_width)
+                   : std::max(1, hnsw.pathwise_width);
+    schedule.init_width =
+            params ? std::max(1, params->pathwise_init_width)
+                   : std::max(1, hnsw.pathwise_init_width);
+    schedule.max_width =
+            params ? std::max(1, params->pathwise_max_width)
+                   : std::max(1, hnsw.pathwise_max_width);
+    schedule.growth_interval =
+            params ? std::max(1, params->pathwise_growth_interval)
+                   : std::max(1, hnsw.pathwise_growth_interval);
+    schedule.staged = params ? params->pathwise_staged : hnsw.pathwise_staged;
+
+    if (!schedule.staged) {
+        schedule.init_width = schedule.fixed_width;
+        schedule.max_width = schedule.fixed_width;
+        return schedule;
+    }
+
+    schedule.max_width = std::max(schedule.init_width, schedule.max_width);
+    return schedule;
+}
+
+int pathwise_width_for_step(const PathwiseSchedule& schedule, int step) {
+    if (!schedule.staged) {
+        return schedule.fixed_width;
+    }
+
+    int width = schedule.init_width;
+    int phase = step / schedule.growth_interval;
+    while (phase-- > 0 && width < schedule.max_width) {
+        if (width > schedule.max_width / 2) {
+            width = schedule.max_width;
+        } else {
+            width *= 2;
+        }
+    }
+    return std::min(width, schedule.max_width);
+}
+
 /** Do a BFS on the candidates list */
 // this is called in search and search_from_level_0
 int search_from_candidates(
@@ -1149,8 +1207,7 @@ int search_from_candidates(
     bool do_dis_check = params ? params->check_relative_distance
                                : hnsw.check_relative_distance;
     int efSearch = params ? params->efSearch : hnsw.efSearch;
-    int pathwise_width = params ? std::max(1, params->pathwise_width)
-                                : std::max(1, hnsw.pathwise_width);
+    PathwiseSchedule pathwise = resolve_pathwise_schedule(hnsw, params);
     const IDSelector* sel = params ? params->sel : nullptr;
 
     for (int i = 0; i < candidates.size(); i++) {
@@ -1262,8 +1319,9 @@ int search_from_candidates(
     bool should_stop = false;
 
     while (candidates.size() > 0 && !should_stop) {
+        int current_pathwise_width = pathwise_width_for_step(pathwise, nstep);
         int expanded = 0;
-        while (expanded < pathwise_width && candidates.size() > 0) {
+        while (expanded < current_pathwise_width && candidates.size() > 0) {
             float d0 = 0;
             int v0 = candidates.pop_min(&d0);
 
@@ -1326,8 +1384,7 @@ int hybrid_search_from_candidates(
     bool do_dis_check = params ? params->check_relative_distance
                                : hnsw.check_relative_distance;
     int efSearch = params ? params->efSearch : hnsw.efSearch;
-    int pathwise_width = params ? std::max(1, params->pathwise_width)
-                                : std::max(1, hnsw.pathwise_width);
+    PathwiseSchedule pathwise = resolve_pathwise_schedule(hnsw, params);
     const IDSelector* sel = params ? params->sel : nullptr;
 
     struct ReplayBatch {
@@ -1342,7 +1399,8 @@ int hybrid_search_from_candidates(
     };
 
     std::unordered_set<int> frontier_seen;
-    frontier_seen.reserve(std::max(8, pathwise_width * std::max(1, hnsw.M * 2)));
+    frontier_seen.reserve(
+            std::max(8, pathwise.max_width * std::max(1, hnsw.M * 2)));
 
     for (int i = 0; i < candidates.size(); i++) {
         idx_t v1 = candidates.ids[i];
@@ -1600,10 +1658,12 @@ int hybrid_search_from_candidates(
     bool should_stop = false;
 
     while (candidates.size() > 0 && !should_stop) {
-        int frontier_capacity = pathwise_width;
+        int frontier_capacity = pathwise_width_for_step(pathwise, nstep);
         if (!do_dis_check) {
             frontier_capacity =
-                    std::min(pathwise_width, std::max(0, efSearch - nstep + 1));
+                    std::min(
+                            frontier_capacity,
+                            std::max(0, efSearch - nstep + 1));
         }
         if (frontier_capacity <= 0) {
             break;
@@ -1811,6 +1871,7 @@ ACORNStats ACORN::hybrid_search(
     debug("%s\n", "reached");
     // debug_search("Hybrid Search, params -- k: %d, filter: %d\n", k, filter);
     ACORNStats stats;
+    PathwiseSchedule pathwise = resolve_pathwise_schedule(*this, params);
     if (entry_point == -1) {
         return stats;
     }
@@ -1824,11 +1885,15 @@ ACORNStats ACORN::hybrid_search(
         hybridDebugExpansionCount = 0;
         if (hybridDebugEnabled) {
             hybrid_debug_log(
-                    "[hybrid-debug q=%d] start k=%d efSearch=%d pathwise_width=%d gamma=%d M=%d M_beta=%d\n",
+                    "[hybrid-debug q=%d] start k=%d efSearch=%d pathwise_width=%d staged=%d init=%d max=%d growth=%d gamma=%d M=%d M_beta=%d\n",
                     hybridDebugActiveQuery,
                     k,
                     efSearch,
-                    pathwise_width,
+                    pathwise.fixed_width,
+                    pathwise.staged ? 1 : 0,
+                    pathwise.init_width,
+                    pathwise.max_width,
+                    pathwise.growth_interval,
                     gamma,
                     M,
                     M_beta);
