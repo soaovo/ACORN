@@ -50,11 +50,11 @@ static const std::string CUSTOM_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata
 static const std::string CUSTOM_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta.txt";
 static const std::string CUSTOM_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth.ivecs";
 
-static const std::string CUSTOM1B_BASE = "/SSD/SIFT1M/sift_base.fvecs";
-static const std::string CUSTOM1B_QUERY = "/SSD/SIFT1M/sift_query.fvecs";
-static const std::string CUSTOM1B_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata.txt";
-static const std::string CUSTOM1B_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta.txt";
-static const std::string CUSTOM1B_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth.ivecs";
+static const std::string CUSTOM1B_BASE = "/SSD/SIFT1B/sift_base.fvecs";
+static const std::string CUSTOM1B_QUERY = "/SSD/SIFT1B/sift_query.fvecs";
+static const std::string CUSTOM1B_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata1B.txt";
+static const std::string CUSTOM1B_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta1B.txt";
+static const std::string CUSTOM1B_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth1B.ivecs";
 
 std::vector<int> load_ints_from_txt(const std::string& path) {
     std::ifstream fin(path);
