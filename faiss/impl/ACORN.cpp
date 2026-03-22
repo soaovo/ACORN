@@ -1430,15 +1430,15 @@ int hybrid_search_from_candidates(
     PathwiseSchedule pathwise = resolve_pathwise_schedule(hnsw, params);
     const IDSelector* sel = params ? params->sel : nullptr;
 
-    struct ReplayBatch {
+    struct DiscoveredNode {
+        int id;
         const char* hop;
-        std::vector<int> ids;
     };
 
     struct FrontierExpansion {
         int v0;
         bool trace_expansion;
-        std::vector<ReplayBatch> batches;
+        std::vector<DiscoveredNode> discovered;
     };
 
     std::unordered_set<int> frontier_seen;
@@ -1459,22 +1459,36 @@ int hybrid_search_from_candidates(
         vt.set(v1);
     }
 
-    auto replay_batch = [&](const ReplayBatch& batch, bool trace_expansion) {
-        if (batch.ids.empty()) {
+    auto merge_frontier_round = [&](const std::vector<FrontierExpansion>& frontier) {
+        std::vector<DiscoveredNode> round_nodes;
+        for (const FrontierExpansion& expansion : frontier) {
+            round_nodes.insert(
+                    round_nodes.end(),
+                    expansion.discovered.begin(),
+                    expansion.discovered.end());
+        }
+        if (round_nodes.empty()) {
             return;
         }
 
-        std::vector<int> ids;
-        ids.reserve(batch.ids.size());
-        for (int id : batch.ids) {
+        std::vector<DiscoveredNode> merged_nodes;
+        merged_nodes.reserve(round_nodes.size());
+        for (const DiscoveredNode& node : round_nodes) {
+            int id = node.id;
             if (vt.get(id)) {
                 continue;
             }
             vt.set(id);
-            ids.push_back(id);
+            merged_nodes.push_back(node);
         }
-        if (ids.empty()) {
+        if (merged_nodes.empty()) {
             return;
+        }
+
+        std::vector<int> ids;
+        ids.reserve(merged_nodes.size());
+        for (const DiscoveredNode& node : merged_nodes) {
+            ids.push_back(node.id);
         }
 
 #if defined(_OPENMP)
@@ -1487,11 +1501,10 @@ int hybrid_search_from_candidates(
         if (use_edgewise) {
             std::vector<float> distances(ids.size());
 
-            if (trace_expansion) {
+            if (hybridDebugEnabled) {
                 hybrid_debug_log(
-                        "  [hybrid-debug q=%d] %s batch=%zu edgewise=1 workers=%d\n",
+                        "  [hybrid-debug q=%d] round batch=%zu edgewise=1 workers=%d\n",
                         hybridDebugActiveQuery,
-                        batch.hop,
                         ids.size(),
                         worker_count);
             }
@@ -1511,6 +1524,7 @@ int hybrid_search_from_candidates(
             for (size_t idx = 0; idx < ids.size(); ++idx) {
                 int id = ids[idx];
                 float distance = distances[idx];
+                const char* hop = merged_nodes[idx].hop;
                 if (!sel || sel->is_member(id)) {
                     if (nres < k) {
                         faiss::maxheap_push(++nres, D, I, distance, id);
@@ -1519,11 +1533,11 @@ int hybrid_search_from_candidates(
                     }
                 }
                 candidates.push(id, distance);
-                if (trace_expansion) {
+                if (hybridDebugEnabled) {
                     hybrid_debug_log(
                             "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
                             hybridDebugActiveQuery,
-                            batch.hop,
+                            hop,
                             id,
                             distance,
                             nres,
@@ -1534,17 +1548,18 @@ int hybrid_search_from_candidates(
         }
 #endif
 
-        if (trace_expansion) {
+        if (hybridDebugEnabled) {
             hybrid_debug_log(
-                    "  [hybrid-debug q=%d] %s batch=%zu edgewise=0\n",
+                    "  [hybrid-debug q=%d] round batch=%zu edgewise=0\n",
                     hybridDebugActiveQuery,
-                    batch.hop,
                     ids.size());
         }
 
         ndis += ids.size();
-        for (int id : ids) {
+        for (size_t idx = 0; idx < ids.size(); ++idx) {
+            int id = ids[idx];
             float distance = qdis(id);
+            const char* hop = merged_nodes[idx].hop;
             if (!sel || sel->is_member(id)) {
                 if (nres < k) {
                     faiss::maxheap_push(++nres, D, I, distance, id);
@@ -1553,11 +1568,11 @@ int hybrid_search_from_candidates(
                 }
             }
             candidates.push(id, distance);
-            if (trace_expansion) {
+            if (hybridDebugEnabled) {
                 hybrid_debug_log(
                         "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
                         hybridDebugActiveQuery,
-                        batch.hop,
+                        hop,
                         id,
                         distance,
                         nres,
@@ -1613,7 +1628,7 @@ int hybrid_search_from_candidates(
 
             if (filter_map[v1]) {
                 if (frontier_seen.insert(v1).second) {
-                    expansion.batches.push_back({"L1", {v1}});
+                    expansion.discovered.push_back({v1, "L1"});
                     if (trace_expansion) {
                         hybrid_debug_log(
                                 "  [hybrid-debug q=%d] L1 collect id=%d num_found=%d\n",
@@ -1690,7 +1705,9 @@ int hybrid_search_from_candidates(
                 }
 
                 if (!second_hop_hits.empty()) {
-                    expansion.batches.push_back({"L2", std::move(second_hop_hits)});
+                    for (int v2 : second_hop_hits) {
+                        expansion.discovered.push_back({v2, "L2"});
+                    }
                 }
             }
         }
@@ -1716,11 +1733,9 @@ int hybrid_search_from_candidates(
                     frontier.push_back(collect_expansion(node));
                 }
 
-                for (const FrontierExpansion& expansion : frontier) {
-                    for (const ReplayBatch& batch : expansion.batches) {
-                        replay_batch(batch, expansion.trace_expansion);
-                    }
+                merge_frontier_round(frontier);
 
+                for (const FrontierExpansion& expansion : frontier) {
                     if (hybridDebugEnabled) {
                         hybrid_debug_log(
                                 "[hybrid-debug q=%d] post-expand v0=%d queue=%d nres=%d ndis=%d\n",
