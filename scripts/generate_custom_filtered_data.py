@@ -22,6 +22,26 @@ def fvecs_mmap(path: str) -> np.ndarray:
     return ivecs_mmap(path).view(np.float32)
 
 
+def xbin_mmap(path: str) -> np.ndarray:
+    header = np.fromfile(path, dtype=np.uint32, count=2)
+    if header.size != 2:
+        raise ValueError("invalid xbin header: %s" % path)
+    n, d = int(header[0]), int(header[1])
+    if path.endswith(".fbin"):
+        return np.memmap(path, dtype=np.float32, mode="r", offset=8, shape=(n, d))
+    if path.endswith(".u8bin"):
+        return np.memmap(path, dtype=np.uint8, mode="r", offset=8, shape=(n, d))
+    raise ValueError("unsupported xbin suffix: %s" % path)
+
+
+def vectors_mmap(path: str) -> np.ndarray:
+    if path.endswith(".fvecs"):
+        return fvecs_mmap(path)
+    if path.endswith(".fbin") or path.endswith(".u8bin"):
+        return xbin_mmap(path)
+    raise ValueError("unsupported vector file: %s" % path)
+
+
 def ivecs_write(path: str, matrix: np.ndarray) -> None:
     matrix = np.asarray(matrix, dtype=np.int32)
     n, d = matrix.shape
@@ -84,8 +104,8 @@ def build_groundtruth(
         base_seed: int,
         query_seed: int,
         base_block: int) -> None:
-    xb = fvecs_mmap(base_path)
-    xq = fvecs_mmap(query_path)
+    xb = vectors_mmap(base_path)
+    xq = vectors_mmap(query_path)
     nb, d = xb.shape
     nq, qd = xq.shape
     if d != qd:

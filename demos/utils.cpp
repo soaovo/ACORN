@@ -33,6 +33,9 @@
 #include <sstream>      // for ostringstream
 #include <fstream>  
 #include <iosfwd>
+#include <cstdint>
+#include <string>
+#include <vector>
 #include <faiss/impl/platform_macros.h>
 #include <assert.h>     /* assert */
 #include <thread>
@@ -50,8 +53,8 @@ static const std::string CUSTOM_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata
 static const std::string CUSTOM_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta.txt";
 static const std::string CUSTOM_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth.ivecs";
 
-static const std::string CUSTOM1B_BASE = "/SSD/SIFT1B/sift_base.fvecs";
-static const std::string CUSTOM1B_QUERY = "/SSD/SIFT1B/sift_query.fvecs";
+static const std::string CUSTOM1B_BASE = "/SSD/SIFT1B/base.1B.u8bin";
+static const std::string CUSTOM1B_QUERY = "/SSD/SIFT1B/query.public.10K.fbin";
 static const std::string CUSTOM1B_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata1B.txt";
 static const std::string CUSTOM1B_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta1B.txt";
 static const std::string CUSTOM1B_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth1B.ivecs";
@@ -130,9 +133,69 @@ bool fileExists(const std::string& filePath) {
     return file.good();
 }
 
+bool has_suffix(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
-float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
-    FILE* f = fopen(fname, "r");
+float* xbin_read(const char* fname, size_t* d_out, size_t* n_out, size_t max_n = 0) {
+    FILE* f = fopen(fname, "rb");
+    if (!f) {
+        fprintf(stderr, "could not open %s\n", fname);
+        perror("");
+        abort();
+    }
+
+    uint32_t n32 = 0;
+    uint32_t d32 = 0;
+    size_t nr = fread(&n32, sizeof(uint32_t), 1, f);
+    nr += fread(&d32, sizeof(uint32_t), 1, f);
+    assert(nr == 2 || !"could not read xbin header");
+    assert(d32 > 0 || !"invalid dimension");
+
+    size_t n = n32;
+    size_t d = d32;
+    size_t to_read = (max_n > 0 && max_n < n) ? max_n : n;
+    *d_out = d;
+    *n_out = to_read;
+
+    float* x = new float[to_read * d];
+    const std::string path(fname);
+
+    if (has_suffix(path, ".fbin")) {
+        size_t got = fread(x, sizeof(float), to_read * d, f);
+        assert(got == to_read * d || !"could not read whole fbin payload");
+    } else if (has_suffix(path, ".u8bin")) {
+        const size_t chunk_vecs = 1 << 16;
+        std::vector<uint8_t> tmp(std::min(to_read, chunk_vecs) * d);
+        size_t written = 0;
+        while (written < to_read) {
+            size_t batch = std::min(to_read - written, chunk_vecs);
+            size_t need = batch * d;
+            size_t got = fread(tmp.data(), sizeof(uint8_t), need, f);
+            assert(got == need || !"could not read whole u8bin payload");
+            for (size_t i = 0; i < need; i++) {
+                x[written * d + i] = float(tmp[i]);
+            }
+            written += batch;
+        }
+    } else {
+        fclose(f);
+        delete[] x;
+        FAISS_THROW_MSG("xbin_read only supports .fbin and .u8bin");
+    }
+
+    fclose(f);
+    return x;
+}
+
+float* fvecs_read_n(const char* fname, size_t* d_out, size_t* n_out, size_t max_n = 0) {
+    const std::string path(fname);
+    if (has_suffix(path, ".fbin") || has_suffix(path, ".u8bin")) {
+        return xbin_read(fname, d_out, n_out, max_n);
+    }
+
+    FILE* f = fopen(fname, "rb");
     if (!f) {
         fprintf(stderr, "could not open %s\n", fname);
         perror("");
@@ -147,19 +210,25 @@ float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
     size_t sz = st.st_size;
     assert(sz % ((d + 1) * 4) == 0 || !"weird file size");
     size_t n = sz / ((d + 1) * 4);
+    size_t to_read = (max_n > 0 && max_n < n) ? max_n : n;
 
     *d_out = d;
-    *n_out = n;
-    float* x = new float[n * (d + 1)];
-    size_t nr = fread(x, sizeof(float), n * (d + 1), f);
-    assert(nr == n * (d + 1) || !"could not read whole file");
+    *n_out = to_read;
+    float* x = new float[to_read * (d + 1)];
+    size_t got = fread(x, sizeof(float), to_read * (d + 1), f);
+    assert(got == to_read * (d + 1) || !"could not read whole file");
 
-    // shift array to remove row headers
-    for (size_t i = 0; i < n; i++)
+    for (size_t i = 0; i < to_read; i++) {
         memmove(x + i * d, x + 1 + i * (d + 1), d * sizeof(*x));
+    }
 
     fclose(f);
     return x;
+}
+
+
+float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
+    return fvecs_read_n(fname, d_out, n_out, 0);
 }
 
 // not very clean, but works as long as sizeof(int) == sizeof(float)

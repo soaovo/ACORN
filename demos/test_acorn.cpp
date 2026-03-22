@@ -282,7 +282,7 @@ int main(int argc, char *argv[]) {
             size_t nb, d2;
             bool is_base = 1;
             std::string filename = get_file_name(dataset, is_base);
-            float* xb = fvecs_read(filename.c_str(), &d2, &nb);
+            float* xb = fvecs_read_n(filename.c_str(), &d2, &nb, N);
             assert(d == d2 || !"dataset does not dim 128 as expected");
             printf("[%.3f s] Loaded base vectors from file: %s\n", elapsed() - t0, filename.c_str());
 
