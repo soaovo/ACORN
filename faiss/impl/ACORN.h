@@ -44,6 +44,7 @@ struct SearchParametersACORN : SearchParameters {
     int pathwise_max_width = 1;
     int pathwise_growth_interval = 4;
     bool pathwise_staged = false;
+    bool reduced_sync = true;
     int edgewise_nt = 0; // 0 -> use omp_get_max_threads()
 
     ~SearchParametersACORN() {}
@@ -155,6 +156,7 @@ struct ACORN {
     int pathwise_max_width;
     int pathwise_growth_interval;
     bool pathwise_staged;
+    bool reduced_sync;
 
     /// during search: do we check whether the next best distance is good
     /// enough?

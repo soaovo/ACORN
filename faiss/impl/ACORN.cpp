@@ -161,6 +161,7 @@ ACORN::ACORN(int M, int gamma, std::vector<int>& metadata, int M_beta) : rng(123
     pathwise_max_width = 1;
     pathwise_growth_interval = 4;
     pathwise_staged = false;
+    reduced_sync = true;
     efConstruction = M * gamma; //added gamma
     upper_beam = 1;
     this->gamma = gamma;
@@ -1264,6 +1265,7 @@ int search_from_candidates(
                                : hnsw.check_relative_distance;
     int efSearch = params ? params->efSearch : hnsw.efSearch;
     PathwiseSchedule pathwise = resolve_pathwise_schedule(hnsw, params);
+    bool reduced_sync = params ? params->reduced_sync : hnsw.reduced_sync;
     const IDSelector* sel = params ? params->sel : nullptr;
 
     for (int i = 0; i < candidates.size(); i++) {
@@ -1283,6 +1285,97 @@ int search_from_candidates(
     struct FrontierExpansion {
         int v0;
         std::vector<int> discovered;
+    };
+
+    auto direct_expand_candidate = [&](int v0) {
+        size_t begin, end;
+        hnsw.neighbor_range(v0, level, &begin, &end);
+        size_t degree = end - begin;
+
+        bool use_edgewise = dc_pool && dc_pool->size() > 1 &&
+                degree >= dc_pool->size() * 2;
+
+#if defined(_OPENMP)
+        if (use_edgewise) {
+            int worker_count = static_cast<int>(dc_pool->size());
+            std::vector<std::vector<std::pair<int, float>>> local_candidates(
+                    worker_count);
+            std::vector<int> local_ndis(worker_count, 0);
+
+#pragma omp parallel num_threads(worker_count)
+            {
+                int tid = omp_get_thread_num();
+                DistanceComputer& worker = *(*dc_pool)[tid];
+                auto& local = local_candidates[tid];
+                int local_count = 0;
+
+#pragma omp for schedule(static)
+                for (int offset = 0; offset < (int)degree; ++offset) {
+                    size_t j = begin + offset;
+                    int v1 = hnsw.neighbors[j];
+                    if (v1 < 0) {
+                        continue;
+                    }
+                    bool inserted = false;
+                    if (!vt.get(v1)) {
+#pragma omp critical(acorn_edgewise_visit)
+                        {
+                            if (!vt.get(v1)) {
+                                vt.set(v1);
+                                inserted = true;
+                            }
+                        }
+                    }
+                    if (!inserted) {
+                        continue;
+                    }
+                    local_count++;
+                    float d = worker(v1);
+                    local.emplace_back(v1, d);
+                }
+
+                local_ndis[tid] = local_count;
+            }
+
+            for (int tid = 0; tid < worker_count; ++tid) {
+                ndis += local_ndis[tid];
+                for (auto& entry : local_candidates[tid]) {
+                    int v1 = entry.first;
+                    float d = entry.second;
+                    if (!sel || sel->is_member(v1)) {
+                        if (nres < k) {
+                            faiss::maxheap_push(++nres, D, I, d, v1);
+                        } else if (d < D[0]) {
+                            faiss::maxheap_replace_top(nres, D, I, d, v1);
+                        }
+                    }
+                    candidates.push(v1, d);
+                }
+            }
+            return;
+        }
+#endif
+
+        for (size_t j = begin; j < end; j++) {
+            int v1 = hnsw.neighbors[j];
+            if (v1 < 0) {
+                break;
+            }
+            if (vt.get(v1)) {
+                continue;
+            }
+            vt.set(v1);
+            ndis++;
+            float d = qdis(v1);
+            if (!sel || sel->is_member(v1)) {
+                if (nres < k) {
+                    faiss::maxheap_push(++nres, D, I, d, v1);
+                } else if (d < D[0]) {
+                    faiss::maxheap_replace_top(nres, D, I, d, v1);
+                }
+            }
+            candidates.push(v1, d);
+        }
     };
 
     auto collect_expansion = [&](const FrontierNode& node) {
@@ -1393,6 +1486,12 @@ int search_from_candidates(
             nstep,
             should_stop,
             [&](const std::vector<FrontierNode>& frontier) {
+                if (!reduced_sync) {
+                    for (const FrontierNode& node : frontier) {
+                        direct_expand_candidate(node.id);
+                    }
+                    return static_cast<int>(frontier.size());
+                }
                 std::vector<FrontierExpansion> expansions(frontier.size());
 
 #if defined(_OPENMP)
@@ -1459,6 +1558,7 @@ int hybrid_search_from_candidates(
                                : hnsw.check_relative_distance;
     int efSearch = params ? params->efSearch : hnsw.efSearch;
     PathwiseSchedule pathwise = resolve_pathwise_schedule(hnsw, params);
+    bool reduced_sync = params ? params->reduced_sync : hnsw.reduced_sync;
     const IDSelector* sel = params ? params->sel : nullptr;
 
     struct DiscoveredNode {
@@ -1471,6 +1571,7 @@ int hybrid_search_from_candidates(
         bool trace_expansion;
         std::vector<DiscoveredNode> discovered;
     };
+    std::vector<FrontierExpansion> frontier_single(1);
 
     for (int i = 0; i < candidates.size(); i++) {
         idx_t v1 = candidates.ids[i];
@@ -1753,6 +1854,23 @@ int hybrid_search_from_candidates(
             nstep,
             should_stop,
             [&](const std::vector<FrontierNode>& frontier_nodes) {
+                if (!reduced_sync) {
+                    for (const FrontierNode& node : frontier_nodes) {
+                        frontier_single[0] = collect_expansion(node);
+                        merge_frontier_round(frontier_single);
+
+                        if (hybridDebugEnabled) {
+                            hybrid_debug_log(
+                                    "[hybrid-debug q=%d] post-expand v0=%d queue=%d nres=%d ndis=%d\n",
+                                    hybridDebugActiveQuery,
+                                    frontier_single[0].v0,
+                                    candidates.size(),
+                                    nres,
+                                    ndis);
+                        }
+                    }
+                    return static_cast<int>(frontier_nodes.size());
+                }
                 std::vector<FrontierExpansion> frontier(frontier_nodes.size());
 
 #if defined(_OPENMP)

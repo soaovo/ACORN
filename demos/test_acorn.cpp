@@ -65,6 +65,7 @@ int main(int argc, char *argv[]) {
     int pathwise_width = 1;
     int pathwise_growth_interval = 4;
     bool pathwise_staged = false;
+    bool reduced_sync = true;
     // int filter = 0;
     std::string dataset; // must be sift1B or sift1M or tripclick or custom/custom1B
     int test_partitions = 0;
@@ -82,10 +83,10 @@ int main(int argc, char *argv[]) {
     int opt;
     {// parse arguments
 
-        if (argc < 6 || argc > 9) {
+        if (argc < 6 || argc > 10) {
             fprintf(
                     stderr,
-                    "Syntax: %s <number vecs> <gamma> <dataset> <M> <M_beta> [<pathwise_max_width> [<pathwise_growth_interval> [<efSearch>]]]\n",
+                    "Syntax: %s <number vecs> <gamma> <dataset> <M> <M_beta> [<pathwise_max_width> [<pathwise_growth_interval> [<efSearch> [<reduced_sync>]]]]\n",
                     argv[0]);
             exit(1);
         }
@@ -129,12 +130,15 @@ int main(int argc, char *argv[]) {
             }
             pathwise_staged = true;
         }
-        if (argc == 9) {
+        if (argc >= 9) {
             efs = atoi(argv[8]);
             if (efs < 1) {
                 fprintf(stderr, "Invalid <efSearch>; must be >= 1\n");
                 exit(1);
             }
+        }
+        if (argc == 10) {
+            reduced_sync = atoi(argv[9]) != 0;
         }
 
         const char* efs_env = getenv("ACORN_EFSEARCH");
@@ -145,10 +149,15 @@ int main(int argc, char *argv[]) {
                 exit(1);
             }
         }
+        const char* reduced_sync_env = getenv("ACORN_REDUCED_SYNC");
+        if (reduced_sync_env && reduced_sync_env[0] != '\0') {
+            reduced_sync = atoi(reduced_sync_env) != 0;
+        }
         printf("pathwise_width: %d\n", pathwise_width);
         printf("pathwise_staged: %d\n", pathwise_staged ? 1 : 0);
         printf("pathwise_growth_interval: %d\n", pathwise_growth_interval);
         printf("efSearch: %d\n", efs);
+        printf("reduced_sync: %d\n", reduced_sync ? 1 : 0);
 
     }
     
@@ -455,6 +464,7 @@ int main(int argc, char *argv[]) {
         search_params.pathwise_max_width = pathwise_width;
         search_params.pathwise_growth_interval = pathwise_growth_interval;
         search_params.pathwise_staged = pathwise_staged;
+        search_params.reduced_sync = reduced_sync;
 
         double t1_x = elapsed();
         hybrid_index->search(
