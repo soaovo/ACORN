@@ -45,6 +45,9 @@ struct SearchParametersACORN : SearchParameters {
     int pathwise_growth_interval = 4;
     bool pathwise_staged = false;
     bool reduced_sync = true;
+    int iqan_local_queue_capacity = 0;
+    int iqan_index_threshold = -1;
+    int iqan_seq_iterations = 1;
     int edgewise_nt = 0; // 0 -> use omp_get_max_threads()
 
     ~SearchParametersACORN() {}

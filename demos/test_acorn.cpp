@@ -66,6 +66,9 @@ int main(int argc, char *argv[]) {
     int pathwise_growth_interval = 4;
     bool pathwise_staged = false;
     bool reduced_sync = true;
+    int iqan_local_queue_capacity = 0;
+    int iqan_index_threshold = -1;
+    int iqan_seq_iterations = 1;
     // int filter = 0;
     std::string dataset; // must be sift1B or sift1M or tripclick or custom/custom1B
     int test_partitions = 0;
@@ -153,11 +156,28 @@ int main(int argc, char *argv[]) {
         if (reduced_sync_env && reduced_sync_env[0] != '\0') {
             reduced_sync = atoi(reduced_sync_env) != 0;
         }
+        const char* iqan_local_queue_env = getenv("ACORN_IQAN_LOCAL_QUEUE");
+        if (iqan_local_queue_env && iqan_local_queue_env[0] != '\0') {
+            iqan_local_queue_capacity = atoi(iqan_local_queue_env);
+        }
+        const char* iqan_index_threshold_env =
+                getenv("ACORN_IQAN_INDEX_THRESHOLD");
+        if (iqan_index_threshold_env && iqan_index_threshold_env[0] != '\0') {
+            iqan_index_threshold = atoi(iqan_index_threshold_env);
+        }
+        const char* iqan_seq_iterations_env =
+                getenv("ACORN_IQAN_SEQ_ITERATIONS");
+        if (iqan_seq_iterations_env && iqan_seq_iterations_env[0] != '\0') {
+            iqan_seq_iterations = atoi(iqan_seq_iterations_env);
+        }
         printf("pathwise_width: %d\n", pathwise_width);
         printf("pathwise_staged: %d\n", pathwise_staged ? 1 : 0);
         printf("pathwise_growth_interval: %d\n", pathwise_growth_interval);
         printf("efSearch: %d\n", efs);
         printf("reduced_sync: %d\n", reduced_sync ? 1 : 0);
+        printf("iqan_local_queue_capacity: %d\n", iqan_local_queue_capacity);
+        printf("iqan_index_threshold: %d\n", iqan_index_threshold);
+        printf("iqan_seq_iterations: %d\n", iqan_seq_iterations);
 
     }
     
@@ -465,6 +485,9 @@ int main(int argc, char *argv[]) {
         search_params.pathwise_growth_interval = pathwise_growth_interval;
         search_params.pathwise_staged = pathwise_staged;
         search_params.reduced_sync = reduced_sync;
+        search_params.iqan_local_queue_capacity = iqan_local_queue_capacity;
+        search_params.iqan_index_threshold = iqan_index_threshold;
+        search_params.iqan_seq_iterations = iqan_seq_iterations;
 
         double t1_x = elapsed();
         hybrid_index->search(
