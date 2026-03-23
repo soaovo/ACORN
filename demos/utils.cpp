@@ -55,9 +55,9 @@ static const std::string CUSTOM_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtrut
 
 static const std::string CUSTOM1B_BASE = "/SSD/SIFT1B/base.1B.u8bin";
 static const std::string CUSTOM1B_QUERY = "/SSD/SIFT1B/query.public.10K.fbin";
-static const std::string CUSTOM1B_BASE_META = "/home/cxy/ACORN/ACORN/data/metadata1B.txt";
-static const std::string CUSTOM1B_QUERY_META = "/home/cxy/ACORN/ACORN/data/query_meta1B.txt";
-static const std::string CUSTOM1B_GT = "/home/cxy/ACORN/ACORN/data/sift_groundtruth1B.ivecs";
+static const std::string CUSTOM1B_BASE_META = "/home/cxy/ACORN/data/metadata1B.txt";
+static const std::string CUSTOM1B_QUERY_META = "/home/cxy/ACORN/data/query_meta1B.txt";
+static const std::string CUSTOM1B_GT = "/home/cxy/ACORN/data/sift_groundtruth1B.ivecs";
 
 std::vector<int> load_ints_from_txt(const std::string& path) {
     std::ifstream fin(path);
