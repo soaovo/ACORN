@@ -1146,6 +1146,8 @@ struct FrontierNode {
     int queue_size_after_pop;
 };
 
+constexpr float kReducedSyncAUPRatio = 0.8f;
+
 PathwiseSchedule resolve_pathwise_schedule(
         const ACORN& hnsw,
         const SearchParametersACORN* params) {
@@ -1191,7 +1193,7 @@ int pathwise_width_for_step(const PathwiseSchedule& schedule, int step) {
     return std::min(width, schedule.max_width);
 }
 
-template <typename ConsumeFrontier, typename OnDistanceStop>
+template <typename PrepareLoop, typename ConsumeFrontier, typename OnDistanceStop>
 void run_pathwise_frontier_loop(
         MinimaxHeap& candidates,
         const PathwiseSchedule& pathwise,
@@ -1199,9 +1201,14 @@ void run_pathwise_frontier_loop(
         int efSearch,
         int& nstep,
         bool& should_stop,
+        PrepareLoop&& prepare_loop,
         ConsumeFrontier&& consume_frontier,
         OnDistanceStop&& on_distance_stop) {
-    while (candidates.size() > 0 && !should_stop) {
+    while (!should_stop) {
+        prepare_loop();
+        if (candidates.size() <= 0) {
+            break;
+        }
         int frontier_capacity = pathwise_width_for_step(pathwise, nstep);
         if (!do_dis_check) {
             frontier_capacity =
@@ -1221,9 +1228,12 @@ void run_pathwise_frontier_loop(
             if (do_dis_check) {
                 int n_dis_below = candidates.count_below(d0);
                 if (n_dis_below >= efSearch) {
-                    on_distance_stop(d0, n_dis_below);
-                    should_stop = true;
-                    break;
+                    if (on_distance_stop(d0, n_dis_below)) {
+                        should_stop = true;
+                        break;
+                    }
+                    candidates.push(v0, d0);
+                    continue;
                 }
             }
 
@@ -1285,6 +1295,67 @@ int search_from_candidates(
     struct FrontierExpansion {
         int v0;
         std::vector<int> discovered;
+    };
+
+    struct PendingCandidate {
+        int id;
+        float distance;
+    };
+
+    std::vector<PendingCandidate> pending_candidates;
+    std::unordered_set<int> pending_ids;
+    std::vector<int> pending_update_positions;
+
+    auto queue_capacity = [&]() {
+        return std::max(1, candidates.n);
+    };
+
+    auto estimate_update_position = [&](float distance) {
+        return std::min(queue_capacity(), candidates.count_below(distance) + 1);
+    };
+
+    auto flush_pending_candidates = [&]() {
+        if (pending_candidates.empty()) {
+            return false;
+        }
+        for (const PendingCandidate& pending : pending_candidates) {
+            vt.set(pending.id);
+            if (!sel || sel->is_member(pending.id)) {
+                if (nres < k) {
+                    faiss::maxheap_push(
+                            ++nres, D, I, pending.distance, pending.id);
+                } else if (pending.distance < D[0]) {
+                    faiss::maxheap_replace_top(
+                            nres, D, I, pending.distance, pending.id);
+                }
+            }
+            candidates.push(pending.id, pending.distance);
+        }
+        pending_candidates.clear();
+        pending_ids.clear();
+        pending_update_positions.clear();
+        return true;
+    };
+
+    auto should_flush_pending = [&]() {
+        if (pending_candidates.empty()) {
+            return false;
+        }
+        if (candidates.size() == 0 ||
+            pending_candidates.size() >= (size_t)queue_capacity()) {
+            return true;
+        }
+        if (pending_update_positions.empty()) {
+            return false;
+        }
+        double sum_positions = 0.0;
+        for (int position : pending_update_positions) {
+            sum_positions += position;
+        }
+        double average_position =
+                sum_positions / pending_update_positions.size();
+        return average_position >=
+                kReducedSyncAUPRatio * static_cast<double>(queue_capacity());
     };
 
     auto direct_expand_candidate = [&](int v0) {
@@ -1390,7 +1461,7 @@ int search_from_candidates(
             if (v1 < 0) {
                 break;
             }
-            if (!vt.get(v1)) {
+            if (!vt.get(v1) && pending_ids.find(v1) == pending_ids.end()) {
                 expansion.discovered.push_back(v1);
             }
         }
@@ -1408,32 +1479,42 @@ int search_from_candidates(
         round_seen.reserve(std::max<size_t>(8, reserve));
 
         std::vector<int> merged_ids;
+        std::vector<int> owner_indices;
         merged_ids.reserve(reserve);
-        for (const FrontierExpansion& expansion : frontier) {
+        owner_indices.reserve(reserve);
+        for (int expansion_idx = 0; expansion_idx < (int)frontier.size();
+             ++expansion_idx) {
+            const FrontierExpansion& expansion = frontier[expansion_idx];
             for (int id : expansion.discovered) {
-                if (vt.get(id)) {
+                if (vt.get(id) || pending_ids.find(id) != pending_ids.end()) {
                     continue;
                 }
                 if (!round_seen.insert(id).second) {
                     continue;
                 }
-                vt.set(id);
                 merged_ids.push_back(id);
+                owner_indices.push_back(expansion_idx);
             }
         }
+
+        std::vector<int> best_positions(frontier.size(), queue_capacity());
         if (merged_ids.empty()) {
-            return;
+            pending_update_positions.insert(
+                    pending_update_positions.end(),
+                    best_positions.begin(),
+                    best_positions.end());
+            return should_flush_pending();
         }
 
+        std::vector<float> distances(merged_ids.size());
+        int worker_count = 0;
 #if defined(_OPENMP)
-        int worker_count = dc_pool
+        worker_count = dc_pool
                 ? std::min<int>(
                           static_cast<int>(dc_pool->size()),
                           static_cast<int>(merged_ids.size()))
                 : 0;
         if (worker_count >= 2) {
-            std::vector<float> distances(merged_ids.size());
-
 #pragma omp parallel num_threads(worker_count)
             {
                 int tid = omp_get_thread_num();
@@ -1444,36 +1525,28 @@ int search_from_candidates(
                     distances[idx] = worker(merged_ids[idx]);
                 }
             }
-
-            ndis += merged_ids.size();
+        }
+        if (worker_count < 2) {
             for (size_t idx = 0; idx < merged_ids.size(); ++idx) {
-                int id = merged_ids[idx];
-                float d = distances[idx];
-                if (!sel || sel->is_member(id)) {
-                    if (nres < k) {
-                        faiss::maxheap_push(++nres, D, I, d, id);
-                    } else if (d < D[0]) {
-                        faiss::maxheap_replace_top(nres, D, I, d, id);
-                    }
-                }
-                candidates.push(id, d);
+                distances[idx] = qdis(merged_ids[idx]);
             }
-            return;
         }
-#endif
 
-        for (int id : merged_ids) {
-            ndis++;
-            float d = qdis(id);
-            if (!sel || sel->is_member(id)) {
-                if (nres < k) {
-                    faiss::maxheap_push(++nres, D, I, d, id);
-                } else if (d < D[0]) {
-                    faiss::maxheap_replace_top(nres, D, I, d, id);
-                }
-            }
-            candidates.push(id, d);
+        ndis += merged_ids.size();
+        for (size_t idx = 0; idx < merged_ids.size(); ++idx) {
+            int id = merged_ids[idx];
+            float d = distances[idx];
+            int owner = owner_indices[idx];
+            best_positions[owner] =
+                    std::min(best_positions[owner], estimate_update_position(d));
+            pending_ids.insert(id);
+            pending_candidates.push_back({id, d});
         }
+        pending_update_positions.insert(
+                pending_update_positions.end(),
+                best_positions.begin(),
+                best_positions.end());
+        return should_flush_pending();
     };
 
     int nstep = 0;
@@ -1485,6 +1558,11 @@ int search_from_candidates(
             efSearch,
             nstep,
             should_stop,
+            [&]() {
+                if (reduced_sync && candidates.size() == 0) {
+                    flush_pending_candidates();
+                }
+            },
             [&](const std::vector<FrontierNode>& frontier) {
                 if (!reduced_sync) {
                     for (const FrontierNode& node : frontier) {
@@ -1513,10 +1591,21 @@ int search_from_candidates(
                     }
                 }
 
-                merge_frontier_round(expansions);
+                if (merge_frontier_round(expansions)) {
+                    flush_pending_candidates();
+                }
                 return static_cast<int>(frontier.size());
             },
-            [&](float, int) {});
+            [&](float, int) {
+                if (reduced_sync && flush_pending_candidates()) {
+                    return false;
+                }
+                return true;
+            });
+
+    if (reduced_sync) {
+        flush_pending_candidates();
+    }
 
     if (level == 0) {
         stats.n1++;
@@ -1573,6 +1662,77 @@ int hybrid_search_from_candidates(
     };
     std::vector<FrontierExpansion> frontier_single(1);
 
+    struct PendingCandidate {
+        DiscoveredNode node;
+        float distance;
+    };
+
+    std::vector<PendingCandidate> pending_candidates;
+    std::unordered_set<int> pending_ids;
+    std::vector<int> pending_update_positions;
+
+    auto queue_capacity = [&]() {
+        return std::max(1, candidates.n);
+    };
+
+    auto estimate_update_position = [&](float distance) {
+        return std::min(queue_capacity(), candidates.count_below(distance) + 1);
+    };
+
+    auto flush_pending_candidates = [&]() {
+        if (pending_candidates.empty()) {
+            return false;
+        }
+        for (const PendingCandidate& pending : pending_candidates) {
+            int id = pending.node.id;
+            float distance = pending.distance;
+            vt.set(id);
+            if (!sel || sel->is_member(id)) {
+                if (nres < k) {
+                    faiss::maxheap_push(++nres, D, I, distance, id);
+                } else if (distance < D[0]) {
+                    faiss::maxheap_replace_top(nres, D, I, distance, id);
+                }
+            }
+            candidates.push(id, distance);
+            if (hybridDebugEnabled) {
+                hybrid_debug_log(
+                        "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
+                        hybridDebugActiveQuery,
+                        pending.node.hop,
+                        id,
+                        distance,
+                        nres,
+                        candidates.size());
+            }
+        }
+        pending_candidates.clear();
+        pending_ids.clear();
+        pending_update_positions.clear();
+        return true;
+    };
+
+    auto should_flush_pending = [&]() {
+        if (pending_candidates.empty()) {
+            return false;
+        }
+        if (candidates.size() == 0 ||
+            pending_candidates.size() >= (size_t)queue_capacity()) {
+            return true;
+        }
+        if (pending_update_positions.empty()) {
+            return false;
+        }
+        double sum_positions = 0.0;
+        for (int position : pending_update_positions) {
+            sum_positions += position;
+        }
+        double average_position =
+                sum_positions / pending_update_positions.size();
+        return average_position >=
+                kReducedSyncAUPRatio * static_cast<double>(queue_capacity());
+    };
+
     for (int i = 0; i < candidates.size(); i++) {
         idx_t v1 = candidates.ids[i];
         float d = candidates.dis[i];
@@ -1589,33 +1749,47 @@ int hybrid_search_from_candidates(
 
     auto merge_frontier_round = [&](const std::vector<FrontierExpansion>& frontier) {
         std::vector<DiscoveredNode> round_nodes;
+        std::vector<int> owner_indices;
         for (const FrontierExpansion& expansion : frontier) {
-            round_nodes.insert(
-                    round_nodes.end(),
-                    expansion.discovered.begin(),
-                    expansion.discovered.end());
+            for (const DiscoveredNode& node : expansion.discovered) {
+                round_nodes.push_back(node);
+            }
         }
-        if (round_nodes.empty()) {
-            return;
+        owner_indices.reserve(round_nodes.size());
+        for (int expansion_idx = 0; expansion_idx < (int)frontier.size();
+             ++expansion_idx) {
+            owner_indices.insert(
+                    owner_indices.end(),
+                    frontier[expansion_idx].discovered.size(),
+                    expansion_idx);
         }
 
         std::vector<DiscoveredNode> merged_nodes;
+        std::vector<int> merged_owners;
         merged_nodes.reserve(round_nodes.size());
+        merged_owners.reserve(round_nodes.size());
         std::unordered_set<int> round_seen;
         round_seen.reserve(std::max<size_t>(8, round_nodes.size()));
-        for (const DiscoveredNode& node : round_nodes) {
+        for (size_t idx = 0; idx < round_nodes.size(); ++idx) {
+            const DiscoveredNode& node = round_nodes[idx];
             int id = node.id;
-            if (vt.get(id)) {
+            if (vt.get(id) || pending_ids.find(id) != pending_ids.end()) {
                 continue;
             }
             if (!round_seen.insert(id).second) {
                 continue;
             }
-            vt.set(id);
             merged_nodes.push_back(node);
+            merged_owners.push_back(owner_indices[idx]);
         }
+
+        std::vector<int> best_positions(frontier.size(), queue_capacity());
         if (merged_nodes.empty()) {
-            return;
+            pending_update_positions.insert(
+                    pending_update_positions.end(),
+                    best_positions.begin(),
+                    best_positions.end());
+            return should_flush_pending();
         }
 
         std::vector<int> ids;
@@ -1624,16 +1798,16 @@ int hybrid_search_from_candidates(
             ids.push_back(node.id);
         }
 
+        std::vector<float> distances(ids.size());
+        int worker_count = 0;
 #if defined(_OPENMP)
-        int worker_count = dc_pool
+        worker_count = dc_pool
                 ? std::min<int>(
                           static_cast<int>(dc_pool->size()),
                           static_cast<int>(ids.size()))
                 : 0;
         bool use_edgewise = worker_count >= 2;
         if (use_edgewise) {
-            std::vector<float> distances(ids.size());
-
             if (hybridDebugEnabled) {
                 hybrid_debug_log(
                         "  [hybrid-debug q=%d] round batch=%zu edgewise=1 workers=%d\n",
@@ -1652,66 +1826,35 @@ int hybrid_search_from_candidates(
                     distances[idx] = worker(ids[idx]);
                 }
             }
-
-            ndis += ids.size();
-            for (size_t idx = 0; idx < ids.size(); ++idx) {
-                int id = ids[idx];
-                float distance = distances[idx];
-                const char* hop = merged_nodes[idx].hop;
-                if (!sel || sel->is_member(id)) {
-                    if (nres < k) {
-                        faiss::maxheap_push(++nres, D, I, distance, id);
-                    } else if (distance < D[0]) {
-                        faiss::maxheap_replace_top(nres, D, I, distance, id);
-                    }
-                }
-                candidates.push(id, distance);
-                if (hybridDebugEnabled) {
-                    hybrid_debug_log(
-                            "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
-                            hybridDebugActiveQuery,
-                            hop,
-                            id,
-                            distance,
-                            nres,
-                            candidates.size());
-                }
-            }
-            return;
         }
 #endif
 
-        if (hybridDebugEnabled) {
-            hybrid_debug_log(
-                    "  [hybrid-debug q=%d] round batch=%zu edgewise=0\n",
-                    hybridDebugActiveQuery,
-                    ids.size());
+        if (worker_count < 2) {
+            if (hybridDebugEnabled) {
+                hybrid_debug_log(
+                        "  [hybrid-debug q=%d] round batch=%zu edgewise=0\n",
+                        hybridDebugActiveQuery,
+                        ids.size());
+            }
+            for (size_t idx = 0; idx < ids.size(); ++idx) {
+                distances[idx] = qdis(ids[idx]);
+            }
         }
 
         ndis += ids.size();
         for (size_t idx = 0; idx < ids.size(); ++idx) {
-            int id = ids[idx];
-            float distance = qdis(id);
-            const char* hop = merged_nodes[idx].hop;
-            if (!sel || sel->is_member(id)) {
-                if (nres < k) {
-                    faiss::maxheap_push(++nres, D, I, distance, id);
-                } else if (distance < D[0]) {
-                    faiss::maxheap_replace_top(nres, D, I, distance, id);
-                }
-            }
-            candidates.push(id, distance);
-            if (hybridDebugEnabled) {
-                hybrid_debug_log(
-                        "    [hybrid-debug q=%d] %s push id=%d dis=%g nres=%d cand=%d\n",
-                        hybridDebugActiveQuery,
-                        hop,
-                        id,
-                        distance,
-                        nres,
-                        candidates.size());
-            }
+            int owner = merged_owners[idx];
+            float distance = distances[idx];
+            best_positions[owner] =
+                    std::min(best_positions[owner], estimate_update_position(distance));
+            pending_ids.insert(ids[idx]);
+            pending_candidates.push_back({merged_nodes[idx], distance});
         }
+        pending_update_positions.insert(
+                pending_update_positions.end(),
+                best_positions.begin(),
+                best_positions.end());
+        return should_flush_pending();
     };
 
     auto collect_expansion = [&](const FrontierNode& node) {
@@ -1747,7 +1890,7 @@ int hybrid_search_from_candidates(
                 num_found++;
             }
 
-            if (vt.get(v1)) {
+            if (vt.get(v1) || pending_ids.find(v1) != pending_ids.end()) {
                 if (trace_expansion) {
                     hybrid_debug_log(
                             "  [hybrid-debug q=%d] L1 skip id=%d filter=%d visited=1 num_found=%d\n",
@@ -1808,7 +1951,7 @@ int hybrid_search_from_candidates(
                         continue;
                     }
 
-                    if (vt.get(v2)) {
+                    if (vt.get(v2) || pending_ids.find(v2) != pending_ids.end()) {
                         if (trace_expansion) {
                             hybrid_debug_log(
                                     "    [hybrid-debug q=%d] L2 skip id=%d visited=1 num_found=%d\n",
@@ -1853,6 +1996,11 @@ int hybrid_search_from_candidates(
             efSearch,
             nstep,
             should_stop,
+            [&]() {
+                if (reduced_sync && candidates.size() == 0) {
+                    flush_pending_candidates();
+                }
+            },
             [&](const std::vector<FrontierNode>& frontier_nodes) {
                 if (!reduced_sync) {
                     for (const FrontierNode& node : frontier_nodes) {
@@ -1895,7 +2043,9 @@ int hybrid_search_from_candidates(
                     }
                 }
 
-                merge_frontier_round(frontier);
+                if (merge_frontier_round(frontier)) {
+                    flush_pending_candidates();
+                }
 
                 for (const FrontierExpansion& expansion : frontier) {
                     if (hybridDebugEnabled) {
@@ -1912,6 +2062,19 @@ int hybrid_search_from_candidates(
                 return static_cast<int>(frontier.size());
             },
             [&](float d0, int n_dis_below) {
+                if (reduced_sync && flush_pending_candidates()) {
+                    if (hybridDebugEnabled) {
+                        hybrid_debug_log(
+                                "[hybrid-debug q=%d] flush pending before dis_check stop d0=%g below=%d ef=%d queue=%d nres=%d\n",
+                                hybridDebugActiveQuery,
+                                d0,
+                                n_dis_below,
+                                efSearch,
+                                candidates.size(),
+                                nres);
+                    }
+                    return false;
+                }
                 if (hybridDebugEnabled) {
                     hybrid_debug_log(
                             "[hybrid-debug q=%d] stop by dis_check d0=%g below=%d ef=%d queue=%d nres=%d\n",
@@ -1922,7 +2085,12 @@ int hybrid_search_from_candidates(
                             candidates.size(),
                             nres);
                 }
+                return true;
             });
+
+    if (reduced_sync) {
+        flush_pending_candidates();
+    }
 
     if (level == 0) {
         stats.n1++;
