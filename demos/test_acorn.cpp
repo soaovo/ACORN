@@ -53,7 +53,7 @@ int main(int argc, char *argv[]) {
     double t0 = elapsed();
     
     int efc = 40; // default is 40
-    int efs = 16; //  default is 16
+    int efs = 16; // default is 16, can be overridden by ACORN_EFSEARCH or CLI
     int k = 10; // search parameter
     size_t d = 128; // dimension of the vectors to index - will be overwritten by the dimension of the dataset
     int M; // HSNW param M TODO change M back
@@ -82,10 +82,10 @@ int main(int argc, char *argv[]) {
     int opt;
     {// parse arguments
 
-        if (argc < 6 || argc > 8) {
+        if (argc < 6 || argc > 9) {
             fprintf(
                     stderr,
-                    "Syntax: %s <number vecs> <gamma> <dataset> <M> <M_beta> [<pathwise_max_width> [<pathwise_growth_interval>]]\n",
+                    "Syntax: %s <number vecs> <gamma> <dataset> <M> <M_beta> [<pathwise_max_width> [<pathwise_growth_interval> [<efSearch>]]]\n",
                     argv[0]);
             exit(1);
         }
@@ -121,7 +121,7 @@ int main(int argc, char *argv[]) {
                 exit(1);
             }
         }
-        if (argc == 8) {
+        if (argc >= 8) {
             pathwise_growth_interval = atoi(argv[7]);
             if (pathwise_growth_interval < 1) {
                 fprintf(stderr, "Invalid <pathwise_growth_interval>; must be >= 1\n");
@@ -129,9 +129,26 @@ int main(int argc, char *argv[]) {
             }
             pathwise_staged = true;
         }
+        if (argc == 9) {
+            efs = atoi(argv[8]);
+            if (efs < 1) {
+                fprintf(stderr, "Invalid <efSearch>; must be >= 1\n");
+                exit(1);
+            }
+        }
+
+        const char* efs_env = getenv("ACORN_EFSEARCH");
+        if (efs_env && efs_env[0] != '\0') {
+            efs = atoi(efs_env);
+            if (efs < 1) {
+                fprintf(stderr, "Invalid ACORN_EFSEARCH; must be >= 1\n");
+                exit(1);
+            }
+        }
         printf("pathwise_width: %d\n", pathwise_width);
         printf("pathwise_staged: %d\n", pathwise_staged ? 1 : 0);
         printf("pathwise_growth_interval: %d\n", pathwise_growth_interval);
+        printf("efSearch: %d\n", efs);
 
     }
     
