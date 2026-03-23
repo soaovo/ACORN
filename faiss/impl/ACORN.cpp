@@ -1422,7 +1422,6 @@ int search_from_candidates(
         struct QueueInsertResult {
             int index;
             bool inserted;
-            bool duplicate;
         };
 
         const int master_queue_capacity = std::max(k, efSearch);
@@ -1446,46 +1445,92 @@ int search_from_candidates(
             local_queue.reserve(iqan_local_queue_capacity);
         }
 
-        auto insert_into_queue =
+        auto sort_and_dedup_queue = [&](std::vector<IQANCandidate>& queue) {
+            if (queue.empty()) {
+                return;
+            }
+            std::sort(queue.begin(), queue.end());
+            size_t out = 0;
+            for (size_t idx = 0; idx < queue.size(); ++idx) {
+                if (out == 0 || queue[idx].id != queue[out - 1].id) {
+                    queue[out++] = queue[idx];
+                } else if (!queue[idx].checked && queue[out - 1].checked) {
+                    queue[out - 1].checked = false;
+                }
+            }
+            queue.resize(out);
+        };
+
+        auto merge_sorted_into_queue =
                 [&](std::vector<IQANCandidate>& queue,
                     int capacity,
-                    const IQANCandidate& candidate) {
-                    auto it = std::lower_bound(
-                            queue.begin(), queue.end(), candidate);
-                    int insert_index = static_cast<int>(it - queue.begin());
-                    if (it != queue.end() && it->id == candidate.id) {
-                        if (!candidate.checked && it->checked) {
-                            it->checked = false;
+                    std::vector<IQANCandidate>& incoming,
+                    bool update_topk) {
+                    if (incoming.empty()) {
+                        return capacity;
+                    }
+                    sort_and_dedup_queue(incoming);
+                    std::vector<IQANCandidate> merged;
+                    merged.reserve(std::min<int>(
+                            capacity,
+                            static_cast<int>(queue.size() + incoming.size())));
+                    size_t q_idx = 0;
+                    size_t in_idx = 0;
+                    int best_insert = capacity;
+                    while ((q_idx < queue.size() || in_idx < incoming.size()) &&
+                           (int)merged.size() < capacity) {
+                        bool take_incoming = false;
+                        bool duplicate = false;
+                        if (q_idx >= queue.size()) {
+                            take_incoming = true;
+                        } else if (in_idx >= incoming.size()) {
+                            take_incoming = false;
+                        } else if (incoming[in_idx] < queue[q_idx]) {
+                            take_incoming = true;
+                        } else if (queue[q_idx] < incoming[in_idx]) {
+                            take_incoming = false;
+                        } else {
+                            duplicate = true;
                         }
-                        return QueueInsertResult{insert_index, false, true};
+
+                        if (duplicate) {
+                            IQANCandidate merged_candidate = queue[q_idx];
+                            if (!incoming[in_idx].checked &&
+                                merged_candidate.checked) {
+                                merged_candidate.checked = false;
+                            }
+                            merged.push_back(merged_candidate);
+                            ++q_idx;
+                            ++in_idx;
+                            continue;
+                        }
+
+                        if (take_incoming) {
+                            if (update_topk) {
+                                update_results(
+                                        incoming[in_idx].id,
+                                        incoming[in_idx].distance);
+                            }
+                            best_insert = std::min<int>(
+                                    best_insert,
+                                    static_cast<int>(merged.size()));
+                            merged.push_back(incoming[in_idx++]);
+                        } else {
+                            merged.push_back(queue[q_idx++]);
+                        }
                     }
-                    if (insert_index == capacity) {
-                        return QueueInsertResult{insert_index, false, false};
-                    }
-                    if ((int)queue.size() < capacity) {
-                        queue.insert(it, candidate);
-                        return QueueInsertResult{insert_index, true, false};
-                    }
-                    queue.insert(it, candidate);
-                    queue.pop_back();
-                    return QueueInsertResult{insert_index, true, false};
+                    queue.swap(merged);
+                    incoming.clear();
+                    return best_insert;
                 };
 
         auto merge_local_queue_into_master =
                 [&](std::vector<IQANCandidate>& local_queue) {
-                    int best_insert = master_queue_capacity;
-                    for (const IQANCandidate& candidate : local_queue) {
-                        QueueInsertResult result = insert_into_queue(
-                                master_queue,
-                                master_queue_capacity,
-                                candidate);
-                        if (result.inserted) {
-                            best_insert = std::min(best_insert, result.index);
-                            update_results(candidate.id, candidate.distance);
-                        }
-                    }
-                    local_queue.clear();
-                    return best_insert;
+                    return merge_sorted_into_queue(
+                            master_queue,
+                            master_queue_capacity,
+                            local_queue,
+                            true);
                 };
 
         auto expand_candidate_into_queue =
@@ -1494,7 +1539,7 @@ int search_from_candidates(
                     std::vector<IQANCandidate>& queue,
                     int queue_capacity,
                     int& local_ndis) {
-                    int best_insert = queue_capacity;
+                    std::vector<IQANCandidate> discovered;
                     size_t begin, end;
                     hnsw.neighbor_range(v0, level, &begin, &end);
                     for (size_t j = begin; j < end; ++j) {
@@ -1517,15 +1562,10 @@ int search_from_candidates(
                         }
                         ++local_ndis;
                         float distance = worker(v1);
-                        QueueInsertResult result = insert_into_queue(
-                                queue,
-                                queue_capacity,
-                                {v1, distance, false});
-                        if (result.inserted) {
-                            best_insert = std::min(best_insert, result.index);
-                        }
+                        discovered.push_back({v1, distance, false});
                     }
-                    return best_insert;
+                    return merge_sorted_into_queue(
+                            queue, queue_capacity, discovered, false);
                 };
 
         size_t k_master = 0;
@@ -1545,7 +1585,7 @@ int search_from_candidates(
                 (dc_pool && !dc_pool->empty()) ? (*dc_pool)[0] : &qdis;
 
         auto expand_master_candidate = [&](int v0) {
-            int best_insert = master_queue_capacity;
+            std::vector<IQANCandidate> discovered;
             int local_ndis = 0;
             size_t begin, end;
             hnsw.neighbor_range(v0, level, &begin, &end);
@@ -1560,17 +1600,11 @@ int search_from_candidates(
                 vt.set(v1);
                 ++local_ndis;
                 float distance = (*master_worker)(v1);
-                QueueInsertResult result = insert_into_queue(
-                        master_queue,
-                        master_queue_capacity,
-                        {v1, distance, false});
-                if (result.inserted) {
-                    best_insert = std::min(best_insert, result.index);
-                    update_results(v1, distance);
-                }
+                discovered.push_back({v1, distance, false});
             }
             ndis += local_ndis;
-            return best_insert;
+            return merge_sorted_into_queue(
+                    master_queue, master_queue_capacity, discovered, true);
         };
 
         auto pick_top_master_to_workers = [&]() {
@@ -1999,46 +2033,92 @@ int hybrid_search_from_candidates(
             local_queue.reserve(iqan_local_queue_capacity);
         }
 
-        auto insert_into_queue =
+        auto sort_and_dedup_queue = [&](std::vector<IQANCandidate>& queue) {
+            if (queue.empty()) {
+                return;
+            }
+            std::sort(queue.begin(), queue.end());
+            size_t out = 0;
+            for (size_t idx = 0; idx < queue.size(); ++idx) {
+                if (out == 0 || queue[idx].id != queue[out - 1].id) {
+                    queue[out++] = queue[idx];
+                } else if (!queue[idx].checked && queue[out - 1].checked) {
+                    queue[out - 1].checked = false;
+                }
+            }
+            queue.resize(out);
+        };
+
+        auto merge_sorted_into_queue =
                 [&](std::vector<IQANCandidate>& queue,
                     int capacity,
-                    const IQANCandidate& candidate) {
-                    auto it = std::lower_bound(
-                            queue.begin(), queue.end(), candidate);
-                    int insert_index = static_cast<int>(it - queue.begin());
-                    if (it != queue.end() && it->id == candidate.id) {
-                        if (!candidate.checked && it->checked) {
-                            it->checked = false;
+                    std::vector<IQANCandidate>& incoming,
+                    bool update_topk) {
+                    if (incoming.empty()) {
+                        return capacity;
+                    }
+                    sort_and_dedup_queue(incoming);
+                    std::vector<IQANCandidate> merged;
+                    merged.reserve(std::min<int>(
+                            capacity,
+                            static_cast<int>(queue.size() + incoming.size())));
+                    size_t q_idx = 0;
+                    size_t in_idx = 0;
+                    int best_insert = capacity;
+                    while ((q_idx < queue.size() || in_idx < incoming.size()) &&
+                           (int)merged.size() < capacity) {
+                        bool take_incoming = false;
+                        bool duplicate = false;
+                        if (q_idx >= queue.size()) {
+                            take_incoming = true;
+                        } else if (in_idx >= incoming.size()) {
+                            take_incoming = false;
+                        } else if (incoming[in_idx] < queue[q_idx]) {
+                            take_incoming = true;
+                        } else if (queue[q_idx] < incoming[in_idx]) {
+                            take_incoming = false;
+                        } else {
+                            duplicate = true;
                         }
-                        return QueueInsertResult{insert_index, false};
+
+                        if (duplicate) {
+                            IQANCandidate merged_candidate = queue[q_idx];
+                            if (!incoming[in_idx].checked &&
+                                merged_candidate.checked) {
+                                merged_candidate.checked = false;
+                            }
+                            merged.push_back(merged_candidate);
+                            ++q_idx;
+                            ++in_idx;
+                            continue;
+                        }
+
+                        if (take_incoming) {
+                            if (update_topk) {
+                                update_results(
+                                        incoming[in_idx].id,
+                                        incoming[in_idx].distance);
+                            }
+                            best_insert = std::min<int>(
+                                    best_insert,
+                                    static_cast<int>(merged.size()));
+                            merged.push_back(incoming[in_idx++]);
+                        } else {
+                            merged.push_back(queue[q_idx++]);
+                        }
                     }
-                    if (insert_index == capacity) {
-                        return QueueInsertResult{insert_index, false};
-                    }
-                    if ((int)queue.size() < capacity) {
-                        queue.insert(it, candidate);
-                        return QueueInsertResult{insert_index, true};
-                    }
-                    queue.insert(it, candidate);
-                    queue.pop_back();
-                    return QueueInsertResult{insert_index, true};
+                    queue.swap(merged);
+                    incoming.clear();
+                    return best_insert;
                 };
 
         auto merge_local_queue_into_master =
                 [&](std::vector<IQANCandidate>& local_queue) {
-                    int best_insert = master_queue_capacity;
-                    for (const IQANCandidate& candidate : local_queue) {
-                        QueueInsertResult result = insert_into_queue(
-                                master_queue,
-                                master_queue_capacity,
-                                candidate);
-                        if (result.inserted) {
-                            best_insert = std::min(best_insert, result.index);
-                            update_results(candidate.id, candidate.distance);
-                        }
-                    }
-                    local_queue.clear();
-                    return best_insert;
+                    return merge_sorted_into_queue(
+                            master_queue,
+                            master_queue_capacity,
+                            local_queue,
+                            true);
                 };
 
         auto expand_candidate_into_queue =
@@ -2047,7 +2127,7 @@ int hybrid_search_from_candidates(
                     std::vector<IQANCandidate>& queue,
                     int queue_capacity,
                     int& local_ndis) {
-                    int best_insert = queue_capacity;
+                    std::vector<IQANCandidate> discovered;
                     size_t begin, end;
                     hnsw.neighbor_range(v0, level, &begin, &end);
 
@@ -2074,14 +2154,7 @@ int hybrid_search_from_candidates(
                             if (inserted) {
                                 ++local_ndis;
                                 float distance = worker(v1);
-                                QueueInsertResult result = insert_into_queue(
-                                        queue,
-                                        queue_capacity,
-                                        {v1, distance, false});
-                                if (result.inserted) {
-                                    best_insert =
-                                            std::min(best_insert, result.index);
-                                }
+                                discovered.push_back({v1, distance, false});
                             }
                             if (num_found >= hnsw.M * 2) {
                                 keep_expanding = false;
@@ -2115,14 +2188,7 @@ int hybrid_search_from_candidates(
                                 if (inserted) {
                                     ++local_ndis;
                                     float distance = worker(v2);
-                                    QueueInsertResult result = insert_into_queue(
-                                            queue,
-                                            queue_capacity,
-                                            {v2, distance, false});
-                                    if (result.inserted) {
-                                        best_insert = std::min(
-                                                best_insert, result.index);
-                                    }
+                                    discovered.push_back({v2, distance, false});
                                 }
                                 if (num_found >= hnsw.M * 2) {
                                     keep_expanding = false;
@@ -2132,7 +2198,8 @@ int hybrid_search_from_candidates(
                         }
                     }
 
-                    return best_insert;
+                    return merge_sorted_into_queue(
+                            queue, queue_capacity, discovered, false);
                 };
 
         size_t k_master = 0;
@@ -2152,7 +2219,7 @@ int hybrid_search_from_candidates(
                 (dc_pool && !dc_pool->empty()) ? (*dc_pool)[0] : &qdis;
 
         auto expand_master_candidate = [&](int v0) {
-            int best_insert = master_queue_capacity;
+            std::vector<IQANCandidate> discovered;
             int local_ndis = 0;
             size_t begin, end;
             hnsw.neighbor_range(v0, level, &begin, &end);
@@ -2171,14 +2238,7 @@ int hybrid_search_from_candidates(
                         vt.set(v1);
                         ++local_ndis;
                         float distance = (*master_worker)(v1);
-                        QueueInsertResult result = insert_into_queue(
-                                master_queue,
-                                master_queue_capacity,
-                                {v1, distance, false});
-                        if (result.inserted) {
-                            best_insert = std::min(best_insert, result.index);
-                            update_results(v1, distance);
-                        }
+                        discovered.push_back({v1, distance, false});
                     }
                     if (num_found >= hnsw.M * 2) {
                         keep_expanding = false;
@@ -2203,15 +2263,7 @@ int hybrid_search_from_candidates(
                             vt.set(v2);
                             ++local_ndis;
                             float distance = (*master_worker)(v2);
-                            QueueInsertResult result = insert_into_queue(
-                                    master_queue,
-                                    master_queue_capacity,
-                                    {v2, distance, false});
-                            if (result.inserted) {
-                                best_insert =
-                                        std::min(best_insert, result.index);
-                                update_results(v2, distance);
-                            }
+                            discovered.push_back({v2, distance, false});
                         }
                         if (num_found >= hnsw.M * 2) {
                             keep_expanding = false;
@@ -2222,7 +2274,8 @@ int hybrid_search_from_candidates(
             }
 
             ndis += local_ndis;
-            return best_insert;
+            return merge_sorted_into_queue(
+                    master_queue, master_queue_capacity, discovered, true);
         };
 
         auto pick_top_master_to_workers = [&]() {
