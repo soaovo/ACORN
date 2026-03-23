@@ -1932,6 +1932,449 @@ int hybrid_search_from_candidates(
         vt.set(v1);
     }
 
+    int iqan_workers = reduced_sync && dc_pool
+            ? std::min<int>(
+                      std::max(1, pathwise.fixed_width),
+                      static_cast<int>(dc_pool->size()))
+            : 0;
+    int iqan_local_queue_capacity =
+            params ? params->iqan_local_queue_capacity : 0;
+    if (iqan_local_queue_capacity <= 0) {
+        iqan_local_queue_capacity = efSearch;
+    }
+    int iqan_index_threshold = params ? params->iqan_index_threshold : -1;
+    if (iqan_index_threshold < 0) {
+        iqan_index_threshold = iqan_local_queue_capacity - 1;
+    }
+    int iqan_seq_iterations = params ? params->iqan_seq_iterations : 1;
+    iqan_seq_iterations = std::max(1, iqan_seq_iterations);
+
+    auto update_results = [&](int id, float distance) {
+        if (!sel || sel->is_member(id)) {
+            if (nres < k) {
+                faiss::maxheap_push(++nres, D, I, distance, id);
+            } else if (distance < D[0]) {
+                faiss::maxheap_replace_top(nres, D, I, distance, id);
+            }
+        }
+    };
+
+    if (level == 0 && iqan_workers >= 2) {
+        struct IQANCandidate {
+            int id;
+            float distance;
+            bool checked;
+
+            bool operator<(const IQANCandidate& other) const {
+                if (distance != other.distance) {
+                    return distance < other.distance;
+                }
+                return id < other.id;
+            }
+        };
+
+        struct QueueInsertResult {
+            int index;
+            bool inserted;
+        };
+
+        const int master_queue_capacity = std::max(k, efSearch);
+        std::vector<IQANCandidate> master_queue;
+        master_queue.reserve(master_queue_capacity);
+        for (int i = 0; i < candidates.size(); ++i) {
+            idx_t id = candidates.ids[i];
+            if (id < 0) {
+                continue;
+            }
+            master_queue.push_back(
+                    {static_cast<int>(id), candidates.dis[i], false});
+        }
+        std::sort(master_queue.begin(), master_queue.end());
+        if ((int)master_queue.size() > master_queue_capacity) {
+            master_queue.resize(master_queue_capacity);
+        }
+
+        std::vector<std::vector<IQANCandidate>> local_queues(iqan_workers);
+        for (std::vector<IQANCandidate>& local_queue : local_queues) {
+            local_queue.reserve(iqan_local_queue_capacity);
+        }
+
+        auto insert_into_queue =
+                [&](std::vector<IQANCandidate>& queue,
+                    int capacity,
+                    const IQANCandidate& candidate) {
+                    auto it = std::lower_bound(
+                            queue.begin(), queue.end(), candidate);
+                    int insert_index = static_cast<int>(it - queue.begin());
+                    if (it != queue.end() && it->id == candidate.id) {
+                        if (!candidate.checked && it->checked) {
+                            it->checked = false;
+                        }
+                        return QueueInsertResult{insert_index, false};
+                    }
+                    if (insert_index == capacity) {
+                        return QueueInsertResult{insert_index, false};
+                    }
+                    if ((int)queue.size() < capacity) {
+                        queue.insert(it, candidate);
+                        return QueueInsertResult{insert_index, true};
+                    }
+                    queue.insert(it, candidate);
+                    queue.pop_back();
+                    return QueueInsertResult{insert_index, true};
+                };
+
+        auto merge_local_queue_into_master =
+                [&](std::vector<IQANCandidate>& local_queue) {
+                    int best_insert = master_queue_capacity;
+                    for (const IQANCandidate& candidate : local_queue) {
+                        QueueInsertResult result = insert_into_queue(
+                                master_queue,
+                                master_queue_capacity,
+                                candidate);
+                        if (result.inserted) {
+                            best_insert = std::min(best_insert, result.index);
+                            update_results(candidate.id, candidate.distance);
+                        }
+                    }
+                    local_queue.clear();
+                    return best_insert;
+                };
+
+        auto expand_candidate_into_queue =
+                [&](DistanceComputer& worker,
+                    int v0,
+                    std::vector<IQANCandidate>& queue,
+                    int queue_capacity,
+                    int& local_ndis) {
+                    int best_insert = queue_capacity;
+                    size_t begin, end;
+                    hnsw.neighbor_range(v0, level, &begin, &end);
+
+                    int num_found = 0;
+                    bool keep_expanding = true;
+                    for (size_t j = begin; j < end; ++j) {
+                        int v1 = hnsw.neighbors[j];
+                        if (v1 < 0) {
+                            break;
+                        }
+
+                        if (filter_map[v1]) {
+                            ++num_found;
+                            bool inserted = false;
+                            if (!vt.get(v1)) {
+#pragma omp critical(acorn_iqan_hybrid_visit)
+                                {
+                                    if (!vt.get(v1)) {
+                                        vt.set(v1);
+                                        inserted = true;
+                                    }
+                                }
+                            }
+                            if (inserted) {
+                                ++local_ndis;
+                                float distance = worker(v1);
+                                QueueInsertResult result = insert_into_queue(
+                                        queue,
+                                        queue_capacity,
+                                        {v1, distance, false});
+                                if (result.inserted) {
+                                    best_insert =
+                                            std::min(best_insert, result.index);
+                                }
+                            }
+                            if (num_found >= hnsw.M * 2) {
+                                keep_expanding = false;
+                                break;
+                            }
+                        }
+
+                        if ((((int)(j - begin) >= hnsw.M_beta) && keep_expanding) ||
+                            hnsw.gamma == 1) {
+                            size_t begin2, end2;
+                            hnsw.neighbor_range(v1, level, &begin2, &end2);
+                            for (size_t j2 = begin2; j2 < end2; ++j2) {
+                                int v2 = hnsw.neighbors[j2];
+                                if (v2 < 0) {
+                                    break;
+                                }
+                                if (!filter_map[v2]) {
+                                    continue;
+                                }
+                                ++num_found;
+                                bool inserted = false;
+                                if (!vt.get(v2)) {
+#pragma omp critical(acorn_iqan_hybrid_visit)
+                                    {
+                                        if (!vt.get(v2)) {
+                                            vt.set(v2);
+                                            inserted = true;
+                                        }
+                                    }
+                                }
+                                if (inserted) {
+                                    ++local_ndis;
+                                    float distance = worker(v2);
+                                    QueueInsertResult result = insert_into_queue(
+                                            queue,
+                                            queue_capacity,
+                                            {v2, distance, false});
+                                    if (result.inserted) {
+                                        best_insert = std::min(
+                                                best_insert, result.index);
+                                    }
+                                }
+                                if (num_found >= hnsw.M * 2) {
+                                    keep_expanding = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    return best_insert;
+                };
+
+        size_t k_master = 0;
+        auto advance_master_cursor = [&]() {
+            while (k_master < master_queue.size() && master_queue[k_master].checked) {
+                ++k_master;
+            }
+        };
+
+        auto should_stop_iqan = [&]() {
+            advance_master_cursor();
+            return k_master >= master_queue.size() ||
+                    (do_dis_check && k_master >= (size_t)efSearch);
+        };
+
+        DistanceComputer* master_worker =
+                (dc_pool && !dc_pool->empty()) ? (*dc_pool)[0] : &qdis;
+
+        auto expand_master_candidate = [&](int v0) {
+            int best_insert = master_queue_capacity;
+            int local_ndis = 0;
+            size_t begin, end;
+            hnsw.neighbor_range(v0, level, &begin, &end);
+
+            int num_found = 0;
+            bool keep_expanding = true;
+            for (size_t j = begin; j < end; ++j) {
+                int v1 = hnsw.neighbors[j];
+                if (v1 < 0) {
+                    break;
+                }
+
+                if (filter_map[v1]) {
+                    ++num_found;
+                    if (!vt.get(v1)) {
+                        vt.set(v1);
+                        ++local_ndis;
+                        float distance = (*master_worker)(v1);
+                        QueueInsertResult result = insert_into_queue(
+                                master_queue,
+                                master_queue_capacity,
+                                {v1, distance, false});
+                        if (result.inserted) {
+                            best_insert = std::min(best_insert, result.index);
+                            update_results(v1, distance);
+                        }
+                    }
+                    if (num_found >= hnsw.M * 2) {
+                        keep_expanding = false;
+                        break;
+                    }
+                }
+
+                if ((((int)(j - begin) >= hnsw.M_beta) && keep_expanding) ||
+                    hnsw.gamma == 1) {
+                    size_t begin2, end2;
+                    hnsw.neighbor_range(v1, level, &begin2, &end2);
+                    for (size_t j2 = begin2; j2 < end2; ++j2) {
+                        int v2 = hnsw.neighbors[j2];
+                        if (v2 < 0) {
+                            break;
+                        }
+                        if (!filter_map[v2]) {
+                            continue;
+                        }
+                        ++num_found;
+                        if (!vt.get(v2)) {
+                            vt.set(v2);
+                            ++local_ndis;
+                            float distance = (*master_worker)(v2);
+                            QueueInsertResult result = insert_into_queue(
+                                    master_queue,
+                                    master_queue_capacity,
+                                    {v2, distance, false});
+                            if (result.inserted) {
+                                best_insert =
+                                        std::min(best_insert, result.index);
+                                update_results(v2, distance);
+                            }
+                        }
+                        if (num_found >= hnsw.M * 2) {
+                            keep_expanding = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            ndis += local_ndis;
+            return best_insert;
+        };
+
+        auto pick_top_master_to_workers = [&]() {
+            bool assigned = false;
+            int dest_queue = 0;
+            for (size_t idx = k_master; idx < master_queue.size(); ++idx) {
+                IQANCandidate& candidate = master_queue[idx];
+                if (candidate.checked) {
+                    continue;
+                }
+                local_queues[dest_queue].push_back(candidate);
+                candidate.checked = true;
+                assigned = true;
+                if ((int)local_queues[dest_queue].size() ==
+                    iqan_local_queue_capacity) {
+                    break;
+                }
+                ++dest_queue;
+                if (dest_queue == iqan_workers) {
+                    dest_queue = 0;
+                }
+            }
+            return assigned;
+        };
+
+        int seq_iter = 0;
+        while (seq_iter < iqan_seq_iterations && !should_stop_iqan()) {
+            IQANCandidate& candidate = master_queue[k_master];
+            candidate.checked = true;
+            int insert_index = expand_master_candidate(candidate.id);
+            if (insert_index <= (int)k_master) {
+                k_master = std::max(0, insert_index);
+            } else {
+                ++k_master;
+            }
+            ++seq_iter;
+        }
+
+        while (!should_stop_iqan()) {
+            if (!pick_top_master_to_workers()) {
+                break;
+            }
+
+            std::vector<int> local_best_index(iqan_workers, 0);
+            std::vector<int> local_ndis(iqan_workers, 0);
+            int checker_id = 0;
+            bool need_merge = false;
+
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(iqan_workers) shared(need_merge, checker_id, local_best_index, local_ndis)
+            {
+                int worker_id = omp_get_thread_num();
+                DistanceComputer& worker = *(*dc_pool)[worker_id];
+                std::vector<IQANCandidate>& local_queue = local_queues[worker_id];
+                size_t k_local = 0;
+                while (!need_merge && k_local < local_queue.size()) {
+                    IQANCandidate& candidate = local_queue[k_local];
+                    if (candidate.checked) {
+                        ++k_local;
+                        continue;
+                    }
+                    candidate.checked = true;
+                    int insert_index = expand_candidate_into_queue(
+                            worker,
+                            candidate.id,
+                            local_queue,
+                            iqan_local_queue_capacity,
+                            local_ndis[worker_id]);
+                    if (insert_index <= (int)k_local) {
+                        k_local = std::max(0, insert_index);
+                    } else {
+                        ++k_local;
+                    }
+                    if (insert_index >= iqan_local_queue_capacity) {
+                        insert_index = iqan_local_queue_capacity - 1;
+                    }
+                    local_best_index[worker_id] = std::max(0, insert_index);
+
+#pragma omp critical(acorn_iqan_hybrid_merge_check)
+                    {
+                        if (!need_merge && worker_id == checker_id) {
+                            double mean_index = 0.0;
+                            for (int value : local_best_index) {
+                                mean_index += value;
+                            }
+                            mean_index /= iqan_workers;
+                            if (mean_index >= iqan_index_threshold) {
+                                need_merge = true;
+                            }
+                            checker_id = (checker_id + 1) % iqan_workers;
+                        }
+                    }
+                }
+            }
+#else
+            for (int worker_id = 0; worker_id < iqan_workers; ++worker_id) {
+                DistanceComputer& worker = *(*dc_pool)[worker_id];
+                std::vector<IQANCandidate>& local_queue = local_queues[worker_id];
+                size_t k_local = 0;
+                while (k_local < local_queue.size()) {
+                    IQANCandidate& candidate = local_queue[k_local];
+                    if (candidate.checked) {
+                        ++k_local;
+                        continue;
+                    }
+                    candidate.checked = true;
+                    int insert_index = expand_candidate_into_queue(
+                            worker,
+                            candidate.id,
+                            local_queue,
+                            iqan_local_queue_capacity,
+                            local_ndis[worker_id]);
+                    if (insert_index <= (int)k_local) {
+                        k_local = std::max(0, insert_index);
+                    } else {
+                        ++k_local;
+                    }
+                }
+            }
+#endif
+
+            for (int value : local_ndis) {
+                ndis += value;
+            }
+
+            int best_insert = master_queue_capacity;
+            for (std::vector<IQANCandidate>& local_queue : local_queues) {
+                if (local_queue.empty()) {
+                    continue;
+                }
+                best_insert =
+                        std::min(best_insert, merge_local_queue_into_master(local_queue));
+            }
+
+            if (best_insert <= (int)k_master) {
+                k_master = std::max(0, best_insert);
+            } else {
+                advance_master_cursor();
+            }
+        }
+
+        if (level == 0) {
+            stats.n1++;
+            if (should_stop_iqan()) {
+                stats.n2++;
+            }
+            stats.n3 += ndis;
+        }
+
+        return nres;
+    }
+
     auto merge_frontier_round = [&](const std::vector<FrontierExpansion>& frontier) {
         std::vector<DiscoveredNode> round_nodes;
         for (const FrontierExpansion& expansion : frontier) {
