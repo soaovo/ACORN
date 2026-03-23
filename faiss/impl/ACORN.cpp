@@ -1280,94 +1280,106 @@ int search_from_candidates(
         vt.set(v1);
     }
 
-    auto expand_candidate = [&](int v0) {
+    struct FrontierExpansion {
+        int v0;
+        std::vector<int> discovered;
+    };
+
+    auto collect_expansion = [&](const FrontierNode& node) {
+        int v0 = node.id;
         size_t begin, end;
         hnsw.neighbor_range(v0, level, &begin, &end);
-        size_t degree = end - begin;
-
-        bool use_edgewise = dc_pool && dc_pool->size() > 1 &&
-                degree >= dc_pool->size() * 2;
-
-#if defined(_OPENMP)
-        if (use_edgewise) {
-            int worker_count = static_cast<int>(dc_pool->size());
-            std::vector<std::vector<std::pair<int, float>>> local_candidates(
-                    worker_count);
-            std::vector<int> local_ndis(worker_count, 0);
-
-#pragma omp parallel num_threads(worker_count)
-            {
-                int tid = omp_get_thread_num();
-                DistanceComputer& worker = *(*dc_pool)[tid];
-                auto& local = local_candidates[tid];
-                int local_count = 0;
-
-#pragma omp for schedule(static)
-                for (int offset = 0; offset < (int)degree; ++offset) {
-                    size_t j = begin + offset;
-                    int v1 = hnsw.neighbors[j];
-                    if (v1 < 0) {
-                        continue;
-                    }
-                    bool inserted = false;
-                    if (!vt.get(v1)) {
-#pragma omp critical(acorn_edgewise_visit)
-                        {
-                            if (!vt.get(v1)) {
-                                vt.set(v1);
-                                inserted = true;
-                            }
-                        }
-                    }
-                    if (!inserted) {
-                        continue;
-                    }
-                    local_count++;
-                    float d = worker(v1);
-                    local.emplace_back(v1, d);
-                }
-
-                local_ndis[tid] = local_count;
-            }
-
-            for (int tid = 0; tid < worker_count; ++tid) {
-                ndis += local_ndis[tid];
-                for (auto& entry : local_candidates[tid]) {
-                    int v1 = entry.first;
-                    float d = entry.second;
-                    if (!sel || sel->is_member(v1)) {
-                        if (nres < k) {
-                            faiss::maxheap_push(++nres, D, I, d, v1);
-                        } else if (d < D[0]) {
-                            faiss::maxheap_replace_top(nres, D, I, d, v1);
-                        }
-                    }
-                    candidates.push(v1, d);
-                }
-            }
-            return;
-        }
-#endif
+        FrontierExpansion expansion{v0, {}};
+        expansion.discovered.reserve(end - begin);
 
         for (size_t j = begin; j < end; j++) {
             int v1 = hnsw.neighbors[j];
             if (v1 < 0) {
                 break;
             }
-            if (vt.get(v1)) {
-                continue;
+            if (!vt.get(v1)) {
+                expansion.discovered.push_back(v1);
             }
-            vt.set(v1);
-            ndis++;
-            float d = qdis(v1);
-            if (!sel || sel->is_member(v1)) {
-                if (nres < k) {
-                    faiss::maxheap_push(++nres, D, I, d, v1);
-                } else if (d < D[0]) {
-                    faiss::maxheap_replace_top(nres, D, I, d, v1);
+        }
+
+        return expansion;
+    };
+
+    auto merge_frontier_round = [&](const std::vector<FrontierExpansion>& frontier) {
+        size_t reserve = 0;
+        for (const FrontierExpansion& expansion : frontier) {
+            reserve += expansion.discovered.size();
+        }
+
+        std::unordered_set<int> round_seen;
+        round_seen.reserve(std::max<size_t>(8, reserve));
+
+        std::vector<int> merged_ids;
+        merged_ids.reserve(reserve);
+        for (const FrontierExpansion& expansion : frontier) {
+            for (int id : expansion.discovered) {
+                if (vt.get(id)) {
+                    continue;
+                }
+                if (!round_seen.insert(id).second) {
+                    continue;
+                }
+                vt.set(id);
+                merged_ids.push_back(id);
+            }
+        }
+        if (merged_ids.empty()) {
+            return;
+        }
+
+#if defined(_OPENMP)
+        int worker_count = dc_pool
+                ? std::min<int>(
+                          static_cast<int>(dc_pool->size()),
+                          static_cast<int>(merged_ids.size()))
+                : 0;
+        if (worker_count >= 2) {
+            std::vector<float> distances(merged_ids.size());
+
+#pragma omp parallel num_threads(worker_count)
+            {
+                int tid = omp_get_thread_num();
+                DistanceComputer& worker = *(*dc_pool)[tid];
+
+#pragma omp for schedule(static)
+                for (int idx = 0; idx < (int)merged_ids.size(); ++idx) {
+                    distances[idx] = worker(merged_ids[idx]);
                 }
             }
-            candidates.push(v1, d);
+
+            ndis += merged_ids.size();
+            for (size_t idx = 0; idx < merged_ids.size(); ++idx) {
+                int id = merged_ids[idx];
+                float d = distances[idx];
+                if (!sel || sel->is_member(id)) {
+                    if (nres < k) {
+                        faiss::maxheap_push(++nres, D, I, d, id);
+                    } else if (d < D[0]) {
+                        faiss::maxheap_replace_top(nres, D, I, d, id);
+                    }
+                }
+                candidates.push(id, d);
+            }
+            return;
+        }
+#endif
+
+        for (int id : merged_ids) {
+            ndis++;
+            float d = qdis(id);
+            if (!sel || sel->is_member(id)) {
+                if (nres < k) {
+                    faiss::maxheap_push(++nres, D, I, d, id);
+                } else if (d < D[0]) {
+                    faiss::maxheap_replace_top(nres, D, I, d, id);
+                }
+            }
+            candidates.push(id, d);
         }
     };
 
@@ -1381,9 +1393,28 @@ int search_from_candidates(
             nstep,
             should_stop,
             [&](const std::vector<FrontierNode>& frontier) {
-                for (const FrontierNode& node : frontier) {
-                    expand_candidate(node.id);
+                std::vector<FrontierExpansion> expansions(frontier.size());
+
+#if defined(_OPENMP)
+                int worker_count = dc_pool
+                        ? std::min<int>(
+                                  static_cast<int>(dc_pool->size()),
+                                  static_cast<int>(frontier.size()))
+                        : 0;
+                if (worker_count >= 2) {
+#pragma omp parallel for schedule(static) num_threads(worker_count)
+                    for (int idx = 0; idx < (int)frontier.size(); ++idx) {
+                        expansions[idx] = collect_expansion(frontier[idx]);
+                    }
+                } else
+#endif
+                {
+                    for (size_t idx = 0; idx < frontier.size(); ++idx) {
+                        expansions[idx] = collect_expansion(frontier[idx]);
+                    }
                 }
+
+                merge_frontier_round(expansions);
                 return static_cast<int>(frontier.size());
             },
             [&](float, int) {});
@@ -1441,10 +1472,6 @@ int hybrid_search_from_candidates(
         std::vector<DiscoveredNode> discovered;
     };
 
-    std::unordered_set<int> frontier_seen;
-    frontier_seen.reserve(
-            std::max(8, pathwise.max_width * std::max(1, hnsw.M * 2)));
-
     for (int i = 0; i < candidates.size(); i++) {
         idx_t v1 = candidates.ids[i];
         float d = candidates.dis[i];
@@ -1473,9 +1500,14 @@ int hybrid_search_from_candidates(
 
         std::vector<DiscoveredNode> merged_nodes;
         merged_nodes.reserve(round_nodes.size());
+        std::unordered_set<int> round_seen;
+        round_seen.reserve(std::max<size_t>(8, round_nodes.size()));
         for (const DiscoveredNode& node : round_nodes) {
             int id = node.id;
             if (vt.get(id)) {
+                continue;
+            }
+            if (!round_seen.insert(id).second) {
                 continue;
             }
             vt.set(id);
@@ -1627,15 +1659,13 @@ int hybrid_search_from_candidates(
             }
 
             if (filter_map[v1]) {
-                if (frontier_seen.insert(v1).second) {
-                    expansion.discovered.push_back({v1, "L1"});
-                    if (trace_expansion) {
-                        hybrid_debug_log(
-                                "  [hybrid-debug q=%d] L1 collect id=%d num_found=%d\n",
-                                hybridDebugActiveQuery,
-                                v1,
-                                num_found);
-                    }
+                expansion.discovered.push_back({v1, "L1"});
+                if (trace_expansion) {
+                    hybrid_debug_log(
+                            "  [hybrid-debug q=%d] L1 collect id=%d num_found=%d\n",
+                            hybridDebugActiveQuery,
+                            v1,
+                            num_found);
                 }
 
                 if (num_found >= hnsw.M * 2) {
@@ -1688,9 +1718,7 @@ int hybrid_search_from_candidates(
                         continue;
                     }
 
-                    if (frontier_seen.insert(v2).second) {
-                        second_hop_hits.push_back(v2);
-                    }
+                    second_hop_hits.push_back(v2);
                     if (num_found >= hnsw.M * 2) {
                         keep_expanding = false;
                         if (trace_expansion) {
@@ -1725,12 +1753,28 @@ int hybrid_search_from_candidates(
             nstep,
             should_stop,
             [&](const std::vector<FrontierNode>& frontier_nodes) {
-                std::vector<FrontierExpansion> frontier;
-                frontier.reserve(frontier_nodes.size());
-                frontier_seen.clear();
+                std::vector<FrontierExpansion> frontier(frontier_nodes.size());
 
-                for (const FrontierNode& node : frontier_nodes) {
-                    frontier.push_back(collect_expansion(node));
+#if defined(_OPENMP)
+                int worker_count = dc_pool
+                        ? std::min<int>(
+                                  static_cast<int>(dc_pool->size()),
+                                  static_cast<int>(frontier_nodes.size()))
+                        : 0;
+                if (hybridDebugEnabled) {
+                    worker_count = 0;
+                }
+                if (worker_count >= 2) {
+#pragma omp parallel for schedule(static) num_threads(worker_count)
+                    for (int idx = 0; idx < (int)frontier_nodes.size(); ++idx) {
+                        frontier[idx] = collect_expansion(frontier_nodes[idx]);
+                    }
+                } else
+#endif
+                {
+                    for (size_t idx = 0; idx < frontier_nodes.size(); ++idx) {
+                        frontier[idx] = collect_expansion(frontier_nodes[idx]);
+                    }
                 }
 
                 merge_frontier_round(frontier);
