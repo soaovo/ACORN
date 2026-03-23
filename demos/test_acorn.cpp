@@ -275,7 +275,10 @@ int main(int argc, char *argv[]) {
         assert(base_index && "cached base index type mismatch");
         assert(hybrid_index && "cached hybrid index type mismatch");
         assert(hybrid_index_gamma1 && "cached hybrid gamma1 index type mismatch");
+        base_index->hnsw.efSearch = efs;
+        hybrid_index->acorn.efSearch = efs;
         hybrid_index->acorn.metadata = metadata.data();
+        hybrid_index_gamma1->acorn.efSearch = efs;
         hybrid_index_gamma1->acorn.metadata = metadata.data();
         printf("[%.3f s] Loaded base index from %s\n", elapsed() - t0, base_path.c_str());
         printf("[%.3f s] Loaded hybrid index from %s\n", elapsed() - t0, hybrid_path.c_str());
