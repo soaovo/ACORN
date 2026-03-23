@@ -1526,6 +1526,7 @@ int search_from_candidates(
                 }
             }
         }
+#endif
         if (worker_count < 2) {
             for (size_t idx = 0; idx < merged_ids.size(); ++idx) {
                 distances[idx] = qdis(merged_ids[idx]);
