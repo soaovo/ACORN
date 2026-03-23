@@ -1899,7 +1899,7 @@ int hybrid_search_from_candidates(
                     }
                 }
 
-                return static_cast<int>(frontier_nodes.size());
+                return static_cast<int>(frontier.size());
             },
             [&](float d0, int n_dis_below) {
                 if (hybridDebugEnabled) {
