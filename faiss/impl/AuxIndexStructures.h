@@ -174,6 +174,19 @@ struct VisitedTable {
         visited[no] = visno;
     }
 
+    /// atomically set flag #no to true if it is not already set
+    bool try_set(int no) {
+        uint8_t* slot = &visited[no];
+        uint8_t current = *slot;
+        while (current != visno) {
+            if (__sync_bool_compare_and_swap(slot, current, (uint8_t)visno)) {
+                return true;
+            }
+            current = *slot;
+        }
+        return false;
+    }
+
     /// get flag #no
     bool get(int no) const {
         return visited[no] == visno;
