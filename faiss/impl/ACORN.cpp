@@ -13,6 +13,8 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <string>
 
 #include <faiss/impl/AuxIndexStructures.h>
@@ -1997,406 +1999,332 @@ int hybrid_search_from_candidates(
             fflush(stdout);
         }
 
-        struct IQANCandidate {
+        // ====== iQAN-style in-place sorted queue implementation ======
+        // Matches iQAN paper: fixed-size pre-allocated arrays, binary
+        // search + memmove insertion, zero heap allocation in hot path.
+
+        struct Candidate {
             int id;
             float distance;
             bool checked;
-
-            bool operator<(const IQANCandidate& other) const {
-                if (distance != other.distance) {
-                    return distance < other.distance;
-                }
-                return id < other.id;
+            bool operator<(const Candidate& o) const {
+                return distance < o.distance ||
+                       (distance == o.distance && id < o.id);
             }
         };
 
-        struct QueueInsertResult {
-            int index;
-            bool inserted;
+        const int L = std::max(k, efSearch); // master queue capacity
+
+        // Pre-allocate all queues in one contiguous array (iQAN layout):
+        // [local_queue_0 | local_queue_1 | ... | local_queue_{W-1} | master_queue]
+        const int local_cap = iqan_local_queue_capacity;
+        const int total_slots = iqan_workers * local_cap + L;
+        std::vector<Candidate> set_L(total_slots);
+        std::vector<int> queue_starts(iqan_total_threads);
+        std::vector<int> queue_sizes(iqan_total_threads, 0);
+        for (int i = 0; i < iqan_workers; ++i) {
+            queue_starts[i] = i * local_cap;
+        }
+        const int master_start = iqan_workers * local_cap;
+        queue_starts[iqan_workers] = master_start;
+
+        // In-place insert: binary search + memmove, returns insert position
+        auto add_into_queue = [](std::vector<Candidate>& q, int q_start,
+                                 int& q_size, int q_cap,
+                                 const Candidate& cand) -> int {
+            if (q_size == 0) {
+                q[q_start] = cand;
+                ++q_size;
+                return 0;
+            }
+            auto it = std::lower_bound(
+                    q.begin() + q_start,
+                    q.begin() + q_start + q_size, cand);
+            int insert_loc = static_cast<int>(it - (q.begin() + q_start));
+            if (insert_loc < q_size) {
+                if (it->id == cand.id) {
+                    return q_cap; // duplicate
+                }
+                if (q_size >= q_cap) {
+                    --q_size;
+                }
+            } else {
+                if (q_size < q_cap) {
+                    q[q_start + q_size] = cand;
+                    ++q_size;
+                    return q_size - 1;
+                }
+                return q_cap; // beyond capacity
+            }
+            int abs_loc = q_start + insert_loc;
+            std::memmove(&q[abs_loc + 1], &q[abs_loc],
+                         (q_size - insert_loc) * sizeof(Candidate));
+            q[abs_loc] = cand;
+            ++q_size;
+            return insert_loc;
         };
 
-        const int master_queue_capacity = std::max(k, efSearch);
-        std::vector<IQANCandidate> master_queue;
-        master_queue.reserve(master_queue_capacity);
+        // Merge queue2 into queue1 (fixed size), returns lowest insert pos
+        auto merge_into_fixed = [&](std::vector<Candidate>& q,
+                                    int q1_start, int q1_size,
+                                    int q2_start, int& q2_size) -> int {
+            if (q2_size == 0) return q1_size;
+            // Find insert point of first element
+            auto it = std::lower_bound(
+                    q.begin() + q1_start,
+                    q.begin() + q1_start + q1_size,
+                    q[q2_start]);
+            int insert_idx = static_cast<int>(it - (q.begin() + q1_start));
+            if (insert_idx >= q1_size) {
+                q2_size = 0;
+                return q1_size;
+            }
+            // Insert first element
+            if (q[q2_start].id != it->id) {
+                int abs = q1_start + insert_idx;
+                std::memmove(&q[abs + 1], &q[abs],
+                             (q1_size - insert_idx - 1) * sizeof(Candidate));
+                q[abs] = q[q2_start];
+            }
+            // Merge remaining
+            int qi1 = insert_idx + 1 + q1_start;
+            int qi2 = q2_start + 1;
+            int qi1_end = q1_start + q1_size;
+            int qi2_end = q2_start + q2_size;
+            for (int ins_i = insert_idx + 1; ins_i < q1_size; ++ins_i) {
+                if (qi1 >= qi1_end || qi2 >= qi2_end) break;
+                if (q[qi1] < q[qi2]) {
+                    ++qi1;
+                } else if (q[qi2] < q[qi1]) {
+                    int abs = q1_start + ins_i;
+                    std::memmove(&q[abs + 1], &q[abs],
+                                 (q1_size - ins_i - 1) * sizeof(Candidate));
+                    q[abs] = q[qi2++];
+                    ++qi1;
+                } else {
+                    // duplicate
+                    if (!q[qi2].checked && q[qi1].checked) {
+                        q[qi1].checked = false;
+                    }
+                    ++qi2;
+                    ++qi1;
+                }
+            }
+            q2_size = 0;
+            return insert_idx;
+        };
+
+        // Initialize master queue from MinimaxHeap candidates
+        int& master_size = queue_sizes[iqan_workers];
         for (int i = 0; i < candidates.size(); ++i) {
             idx_t id = candidates.ids[i];
-            if (id < 0) {
-                continue;
-            }
-            master_queue.push_back(
-                    {static_cast<int>(id), candidates.dis[i], false});
-        }
-        std::sort(master_queue.begin(), master_queue.end());
-        if ((int)master_queue.size() > master_queue_capacity) {
-            master_queue.resize(master_queue_capacity);
+            if (id < 0) continue;
+            Candidate c{static_cast<int>(id), candidates.dis[i], false};
+            add_into_queue(set_L, master_start, master_size, L, c);
         }
 
-        std::vector<std::vector<IQANCandidate>> local_queues(iqan_workers);
-        for (std::vector<IQANCandidate>& local_queue : local_queues) {
-            local_queue.reserve(iqan_local_queue_capacity);
-        }
-
-        auto sort_and_dedup_queue = [&](std::vector<IQANCandidate>& queue) {
-            if (queue.empty()) {
-                return;
-            }
-            std::sort(queue.begin(), queue.end());
-            size_t out = 0;
-            for (size_t idx = 0; idx < queue.size(); ++idx) {
-                if (out == 0 || queue[idx].id != queue[out - 1].id) {
-                    queue[out++] = queue[idx];
-                } else if (!queue[idx].checked && queue[out - 1].checked) {
-                    queue[out - 1].checked = false;
+        // Expand one candidate's neighbors into a queue (in-place)
+        auto expand_one = [&](DistanceComputer& worker, int v0,
+                              int q_start, int& q_size, int q_cap,
+                              const float& dist_bound,
+                              int& local_ndis) -> int {
+            int nk = q_cap;
+            size_t begin, end;
+            hnsw.neighbor_range(v0, level, &begin, &end);
+            int num_found = 0;
+            bool keep_expanding = true;
+            for (size_t j = begin; j < end; ++j) {
+                int v1 = hnsw.neighbors[j];
+                if (v1 < 0) break;
+                if (filter_map[v1]) {
+                    ++num_found;
+                    if (vt.try_set(v1)) {
+                        ++local_ndis;
+                        float d = worker(v1);
+                        if (d <= dist_bound) {
+                            Candidate c{v1, d, false};
+                            int r = add_into_queue(set_L, q_start, q_size, q_cap, c);
+                            if (r < nk) nk = r;
+                        }
+                    }
+                    if (num_found >= hnsw.M * 2) { keep_expanding = false; break; }
+                }
+                if ((((int)(j - begin) >= hnsw.M_beta) && keep_expanding) ||
+                    hnsw.gamma == 1) {
+                    size_t b2, e2;
+                    hnsw.neighbor_range(v1, level, &b2, &e2);
+                    for (size_t j2 = b2; j2 < e2; ++j2) {
+                        int v2 = hnsw.neighbors[j2];
+                        if (v2 < 0) break;
+                        if (!filter_map[v2]) continue;
+                        ++num_found;
+                        if (vt.try_set(v2)) {
+                            ++local_ndis;
+                            float d = worker(v2);
+                            if (d <= dist_bound) {
+                                Candidate c{v2, d, false};
+                                int r = add_into_queue(set_L, q_start, q_size, q_cap, c);
+                                if (r < nk) nk = r;
+                            }
+                        }
+                        if (num_found >= hnsw.M * 2) { keep_expanding = false; break; }
+                    }
                 }
             }
-            queue.resize(out);
+            return nk;
         };
 
-        auto merge_sorted_into_queue =
-                [&](std::vector<IQANCandidate>& queue,
-                    int capacity,
-                    std::vector<IQANCandidate>& incoming) {
-                    if (incoming.empty()) {
-                        return capacity;
-                    }
-                    sort_and_dedup_queue(incoming);
-                    std::vector<IQANCandidate> merged;
-                    merged.reserve(std::min<int>(
-                            capacity,
-                            static_cast<int>(queue.size() + incoming.size())));
-                    size_t q_idx = 0;
-                    size_t in_idx = 0;
-                    int best_insert = capacity;
-                    while ((q_idx < queue.size() || in_idx < incoming.size()) &&
-                           (int)merged.size() < capacity) {
-                        bool take_incoming = false;
-                        bool duplicate = false;
-                        if (q_idx >= queue.size()) {
-                            take_incoming = true;
-                        } else if (in_idx >= incoming.size()) {
-                            take_incoming = false;
-                        } else if (incoming[in_idx] < queue[q_idx]) {
-                            take_incoming = true;
-                        } else if (queue[q_idx] < incoming[in_idx]) {
-                            take_incoming = false;
-                        } else {
-                            duplicate = true;
-                        }
-
-                        if (duplicate) {
-                            IQANCandidate merged_candidate = queue[q_idx];
-                            if (!incoming[in_idx].checked &&
-                                merged_candidate.checked) {
-                                merged_candidate.checked = false;
-                            }
-                            merged.push_back(merged_candidate);
-                            ++q_idx;
-                            ++in_idx;
-                            continue;
-                        }
-
-                        if (take_incoming) {
-                            best_insert = std::min<int>(
-                                    best_insert,
-                                    static_cast<int>(merged.size()));
-                            merged.push_back(incoming[in_idx++]);
-                        } else {
-                            merged.push_back(queue[q_idx++]);
-                        }
-                    }
-                    queue.swap(merged);
-                    incoming.clear();
-                    return best_insert;
-                };
-
-        auto merge_local_queue_into_master =
-                [&](std::vector<IQANCandidate>& local_queue) {
-                    return merge_sorted_into_queue(
-                            master_queue,
-                            master_queue_capacity,
-                            local_queue);
-                };
-
-        auto expand_candidate_into_queue =
-                [&](DistanceComputer& worker,
-                    int v0,
-                    std::vector<IQANCandidate>& queue,
-                    int queue_capacity,
-                    int& local_ndis) {
-                    std::vector<IQANCandidate> discovered;
-                    size_t begin, end;
-                    hnsw.neighbor_range(v0, level, &begin, &end);
-
-                    int num_found = 0;
-                    bool keep_expanding = true;
-                    for (size_t j = begin; j < end; ++j) {
-                        int v1 = hnsw.neighbors[j];
-                        if (v1 < 0) {
-                            break;
-                        }
-
-                        if (filter_map[v1]) {
-                            ++num_found;
-                            if (vt.try_set(v1)) {
-                                ++local_ndis;
-                                float distance = worker(v1);
-                                discovered.push_back({v1, distance, false});
-                            }
-                            if (num_found >= hnsw.M * 2) {
-                                keep_expanding = false;
-                                break;
-                            }
-                        }
-
-                        if ((((int)(j - begin) >= hnsw.M_beta) && keep_expanding) ||
-                            hnsw.gamma == 1) {
-                            size_t begin2, end2;
-                            hnsw.neighbor_range(v1, level, &begin2, &end2);
-                            for (size_t j2 = begin2; j2 < end2; ++j2) {
-                                int v2 = hnsw.neighbors[j2];
-                                if (v2 < 0) {
-                                    break;
-                                }
-                                if (!filter_map[v2]) {
-                                    continue;
-                                }
-                                ++num_found;
-                                if (vt.try_set(v2)) {
-                                    ++local_ndis;
-                                    float distance = worker(v2);
-                                    discovered.push_back({v2, distance, false});
-                                }
-                                if (num_found >= hnsw.M * 2) {
-                                    keep_expanding = false;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    return merge_sorted_into_queue(queue, queue_capacity, discovered);
-                };
-
-        size_t k_master = 0;
-        auto advance_master_cursor = [&]() {
-            while (k_master < master_queue.size() && master_queue[k_master].checked) {
+        int k_master = 0;
+        auto advance_cursor = [&]() {
+            while (k_master < master_size &&
+                   set_L[master_start + k_master].checked)
                 ++k_master;
-            }
+        };
+        auto stopped = [&]() {
+            advance_cursor();
+            return k_master >= master_size;
         };
 
-        auto should_stop_iqan = [&]() {
-            advance_master_cursor();
-            return k_master >= master_queue.size();
-        };
-
-        DistanceComputer* master_worker = &qdis;
-
-        auto pick_top_master_to_workers = [&]() {
+        // Pick unchecked candidates from master → worker local queues
+        auto pick_to_workers = [&]() -> bool {
             bool assigned = false;
-            int dest_queue = 0;
-            for (size_t idx = k_master; idx < master_queue.size(); ++idx) {
-                IQANCandidate& candidate = master_queue[idx];
-                if (candidate.checked) {
-                    continue;
+            int dest = 0;
+            for (int idx = k_master; idx < master_size; ++idx) {
+                Candidate& c = set_L[master_start + idx];
+                if (c.checked) continue;
+                // Copy to worker's local queue
+                int& ws = queue_sizes[dest];
+                if (ws < local_cap) {
+                    set_L[queue_starts[dest] + ws] = c;
+                    ++ws;
                 }
-                local_queues[dest_queue].push_back(candidate);
-                candidate.checked = true;
+                c.checked = true;
                 assigned = true;
-                if ((int)local_queues[dest_queue].size() ==
-                    iqan_local_queue_capacity) {
-                    break;
-                }
-                ++dest_queue;
-                if (dest_queue == iqan_workers) {
-                    dest_queue = 0;
-                }
+                if (ws >= local_cap) break;
+                ++dest;
+                if (dest >= iqan_workers) dest = 0;
             }
             return assigned;
         };
 
-        const int seq_iter_bound = 1;
-        int seq_iter = 0;
-        while (seq_iter < seq_iter_bound && !should_stop_iqan()) {
-            IQANCandidate& candidate = master_queue[k_master];
-            candidate.checked = true;
+        // Distance bound = last element of master queue
+        auto dist_bound = [&]() -> float {
+            return master_size > 0
+                    ? set_L[master_start + master_size - 1].distance
+                    : std::numeric_limits<float>::max();
+        };
+
+        // Sequential start (1 iteration)
+        {
             int local_ndis = 0;
-            int insert_index = expand_candidate_into_queue(
-                    *master_worker,
-                    candidate.id,
-                    master_queue,
-                    master_queue_capacity,
-                    local_ndis);
-            ndis += local_ndis;
-            if (insert_index <= (int)k_master) {
-                k_master = std::max(0, insert_index);
-            } else {
-                ++k_master;
+            if (!stopped()) {
+                Candidate& c = set_L[master_start + k_master];
+                c.checked = true;
+                int r = expand_one(qdis, c.id, master_start, master_size,
+                                   L, dist_bound(), local_ndis);
+                ndis += local_ndis;
+                if (r <= k_master) k_master = r; else ++k_master;
             }
-            ++seq_iter;
         }
 
-        while (!should_stop_iqan()) {
-            if (!pick_top_master_to_workers()) {
-                break;
-            }
+        // Parallel phase
+        while (!stopped()) {
+            if (!pick_to_workers()) break;
 
             std::vector<int> local_ndis(iqan_total_threads, 0);
-            size_t next_master = k_master;
-            const int subsearch_iterations = iqan_seq_iterations;
+            int next_master = k_master;
+            const int X = iqan_seq_iterations;
 
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(iqan_total_threads) shared(next_master, local_ndis)
             {
                 int tid = omp_get_thread_num();
-                if (tid == iqan_workers) {
-                    size_t k_local = k_master;
-                    int worker_iter = 0;
-                    while (worker_iter < subsearch_iterations &&
-                           k_local < master_queue.size()) {
-                        IQANCandidate& candidate = master_queue[k_local];
-                        if (candidate.checked) {
-                            ++k_local;
-                            continue;
-                        }
-                        candidate.checked = true;
-                        ++worker_iter;
-                        int insert_index = expand_candidate_into_queue(
-                                *master_worker,
-                                candidate.id,
-                                master_queue,
-                                master_queue_capacity,
-                                local_ndis[tid]);
-                        if (insert_index <= (int)k_local) {
-                            k_local = static_cast<size_t>(std::max(0, insert_index));
-                        } else {
-                            ++k_local;
-                        }
-                    }
-                    next_master = k_local;
-                } else {
-                    DistanceComputer& worker = *(*dc_pool)[tid + 1];
-                    std::vector<IQANCandidate>& local_queue = local_queues[tid];
-                    size_t k_local = 0;
-                    int worker_iter = 0;
-                    while (worker_iter < subsearch_iterations &&
-                           k_local < local_queue.size()) {
-                        IQANCandidate& candidate = local_queue[k_local];
-                        if (candidate.checked) {
-                            ++k_local;
-                            continue;
-                        }
-                        candidate.checked = true;
-                        ++worker_iter;
-                        int insert_index = expand_candidate_into_queue(
-                                worker,
-                                candidate.id,
-                                local_queue,
-                                iqan_local_queue_capacity,
-                                local_ndis[tid]);
-                        if (insert_index <= (int)k_local) {
-                            k_local = static_cast<size_t>(std::max(0, insert_index));
-                        } else {
-                            ++k_local;
-                        }
-                    }
+                int qs = queue_starts[tid];
+                int& qsz = queue_sizes[tid];
+                int qcap = (tid == iqan_workers) ? L : local_cap;
+                int k_uc = (tid == iqan_workers) ? k_master : 0;
+                DistanceComputer& w = (tid == iqan_workers)
+                        ? qdis : *(*dc_pool)[tid + 1];
+                float db = dist_bound();
+                int iters = 0;
+                while (iters < X && k_uc < qsz) {
+                    Candidate& c = set_L[qs + k_uc];
+                    if (c.checked) { ++k_uc; continue; }
+                    c.checked = true;
+                    ++iters;
+                    int r = expand_one(w, c.id, qs, qsz, qcap, db,
+                                       local_ndis[tid]);
+                    if (r <= k_uc) k_uc = r; else ++k_uc;
                 }
+                if (tid == iqan_workers) next_master = k_uc;
             }
 #else
-            for (int worker_id = 0; worker_id < iqan_workers; ++worker_id) {
-                DistanceComputer& worker = *(*dc_pool)[worker_id + 1];
-                std::vector<IQANCandidate>& local_queue = local_queues[worker_id];
-                size_t k_local = 0;
-                int worker_iter = 0;
-                while (worker_iter < subsearch_iterations &&
-                       k_local < local_queue.size()) {
-                    IQANCandidate& candidate = local_queue[k_local];
-                    if (candidate.checked) {
-                        ++k_local;
-                        continue;
-                    }
-                    candidate.checked = true;
-                    ++worker_iter;
-                    int insert_index = expand_candidate_into_queue(
-                            worker,
-                            candidate.id,
-                            local_queue,
-                            iqan_local_queue_capacity,
-                            local_ndis[worker_id]);
-                    if (insert_index <= (int)k_local) {
-                        k_local = static_cast<size_t>(std::max(0, insert_index));
-                    } else {
-                        ++k_local;
-                    }
+            // Fallback sequential
+            for (int wid = 0; wid < iqan_workers; ++wid) {
+                int qs = queue_starts[wid];
+                int& qsz = queue_sizes[wid];
+                DistanceComputer& w = *(*dc_pool)[wid + 1];
+                float db = dist_bound();
+                int k_uc = 0, iters = 0;
+                while (iters < X && k_uc < qsz) {
+                    Candidate& c = set_L[qs + k_uc];
+                    if (c.checked) { ++k_uc; continue; }
+                    c.checked = true; ++iters;
+                    int r = expand_one(w, c.id, qs, qsz, local_cap, db,
+                                       local_ndis[wid]);
+                    if (r <= k_uc) k_uc = r; else ++k_uc;
                 }
             }
             {
-                size_t k_local = k_master;
-                int worker_iter = 0;
-                while (worker_iter < subsearch_iterations &&
-                       k_local < master_queue.size()) {
-                    IQANCandidate& candidate = master_queue[k_local];
-                    if (candidate.checked) {
-                        ++k_local;
-                        continue;
-                    }
-                    candidate.checked = true;
-                    ++worker_iter;
-                    int insert_index = expand_candidate_into_queue(
-                            *master_worker,
-                            candidate.id,
-                            master_queue,
-                            master_queue_capacity,
-                            local_ndis[iqan_workers]);
-                    if (insert_index <= (int)k_local) {
-                        k_local = static_cast<size_t>(std::max(0, insert_index));
-                    } else {
-                        ++k_local;
-                    }
+                float db = dist_bound();
+                int k_uc = k_master, iters = 0;
+                while (iters < X && k_uc < master_size) {
+                    Candidate& c = set_L[master_start + k_uc];
+                    if (c.checked) { ++k_uc; continue; }
+                    c.checked = true; ++iters;
+                    int r = expand_one(qdis, c.id, master_start, master_size,
+                                       L, db, local_ndis[iqan_workers]);
+                    if (r <= k_uc) k_uc = r; else ++k_uc;
                 }
-                next_master = k_local;
+                next_master = k_uc;
             }
 #endif
+            for (int v : local_ndis) ndis += v;
 
-            for (int value : local_ndis) {
-                ndis += value;
-            }
-
-            int best_insert = master_queue_capacity;
-            for (std::vector<IQANCandidate>& local_queue : local_queues) {
-                if (local_queue.empty()) {
-                    continue;
-                }
-                best_insert =
-                        std::min(best_insert, merge_local_queue_into_master(local_queue));
+            // Merge all worker queues into master
+            int best_insert = L;
+            for (int wid = 0; wid < iqan_workers; ++wid) {
+                int& ws = queue_sizes[wid];
+                if (ws == 0) continue;
+                int r = merge_into_fixed(set_L, master_start, L,
+                                         queue_starts[wid], ws);
+                if (r < best_insert) best_insert = r;
             }
 
             k_master = next_master;
-            if (best_insert <= (int)k_master) {
-                k_master = static_cast<size_t>(std::max(0, best_insert));
+            if (best_insert <= k_master) {
+                k_master = best_insert;
             } else {
-                advance_master_cursor();
+                advance_cursor();
             }
         }
 
         if (level == 0) {
             stats.n1++;
-            if (should_stop_iqan()) {
-                stats.n2++;
-            }
+            if (stopped()) stats.n2++;
             stats.n3 += ndis;
         }
 
         nres = 0;
-        for (const IQANCandidate& candidate : master_queue) {
-            if (!sel || sel->is_member(candidate.id)) {
+        for (int i = 0; i < master_size; ++i) {
+            const Candidate& c = set_L[master_start + i];
+            if (!sel || sel->is_member(c.id)) {
                 if (nres < k) {
-                    faiss::maxheap_push(++nres, D, I, candidate.distance, candidate.id);
-                } else if (candidate.distance < D[0]) {
-                    faiss::maxheap_replace_top(nres, D, I, candidate.distance, candidate.id);
+                    faiss::maxheap_push(++nres, D, I, c.distance, c.id);
+                } else if (c.distance < D[0]) {
+                    faiss::maxheap_replace_top(nres, D, I, c.distance, c.id);
                 }
-                if (nres >= k) {
-                    break;
-                }
+                if (nres >= k) break;
             }
         }
 
