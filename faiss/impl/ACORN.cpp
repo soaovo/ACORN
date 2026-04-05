@@ -2173,8 +2173,12 @@ int hybrid_search_from_candidates(
 
         int k_master = 0;
         auto advance_cursor = [&]() {
-            while (k_master < L && set_L[master_start + k_master].checked)
-                ++k_master;
+            while (k_master < L) {
+                const Candidate& c = set_L[master_start + k_master];
+                if (c.id < 0) { ++k_master; continue; } // skip sentinel
+                if (c.checked) { ++k_master; continue; }
+                break; // found unchecked real candidate
+            }
         };
         auto stopped = [&]() {
             advance_cursor();
@@ -2253,7 +2257,7 @@ int hybrid_search_from_candidates(
                 int k_uc = 0, iters = 0;
                 while (iters < X && k_uc < qsz) {
                     Candidate& c = set_L[qs + k_uc];
-                    if (c.checked) { ++k_uc; continue; }
+                    if (c.checked || c.id < 0) { ++k_uc; continue; }
                     c.checked = true; ++iters;
                     int r = expand_one(w, c.id, qs, qsz, local_cap, db,
                                        local_ndis[wid]);

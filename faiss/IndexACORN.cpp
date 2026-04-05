@@ -327,45 +327,45 @@ void IndexACORN::search(
 
     int default_edgewise_nt = compute_edgewise_threads(params);
 
-    // Determine pathwise width: >= 2 means intra-query parallel (iQAN mode)
+    // Determine execution mode:
+    // - pathwise_width >= 2: iQAN-style intra-query parallel (pathwise)
+    // - pathwise_width == 1 && edgewise_nt >= 2 && omp_threads == edgewise_nt:
+    //     edgewise intra-query parallel (fair comparison baseline)
+    // - otherwise: inter-query parallel (original batch mode)
     int pathwise_nt = params ? params->pathwise_width : acorn.pathwise_width;
-    bool use_intra_query = pathwise_nt >= 2;
+    int omp_threads = omp_get_max_threads();
+    bool use_intra_query = pathwise_nt >= 2 ||
+            (pathwise_nt == 1 && default_edgewise_nt >= 2 && omp_threads <= default_edgewise_nt);
 
     if (use_intra_query) {
-        // === Intra-query parallel mode (iQAN-style pathwise) ===
-        // Process queries sequentially, but use multiple threads per query.
-        int pool_size = std::min(pathwise_nt, omp_get_max_threads());
-        printf("[PATHWISE] IndexACORN hybrid_search: intra-query mode "
-               "(pathwise_width=%d, pool_size=%d, n_queries=%lld)\n",
-               pathwise_nt, pool_size, (long long)n);
-        fflush(stdout);
+        // === Intra-query mode: one query at a time, multiple threads per query ===
+        // Used for both pathwise (pw>=2) and edgewise (pw=1, ew>=2) single-query comparison.
+        int pool_size = std::min(
+                pathwise_nt >= 2 ? pathwise_nt : default_edgewise_nt,
+                omp_threads);
+
+        // Pre-allocate VisitedTable and DistanceComputers ONCE (reuse across queries)
+        VisitedTable vt(ntotal);
+        std::vector<std::unique_ptr<DistanceComputer>> dc_storage(pool_size);
+        std::vector<DistanceComputer*> dc_raw;
+        dc_raw.reserve(pool_size);
+        for (int t = 0; t < pool_size; ++t) {
+            dc_storage[t].reset(storage_distance_computer(storage));
+            dc_raw.push_back(dc_storage[t].get());
+        }
 
         for (idx_t i = 0; i < n; i++) {
-            if (i == 0) { printf("[PATHWISE-DBG] q0: creating VisitedTable ntotal=%lld\n", (long long)ntotal); fflush(stdout); }
-            VisitedTable vt(ntotal);
-
-            if (i == 0) { printf("[PATHWISE-DBG] q0: creating %d DistanceComputers\n", pool_size); fflush(stdout); }
-            std::vector<std::unique_ptr<DistanceComputer>> dc_storage(pool_size);
-            std::vector<DistanceComputer*> dc_raw;
-            dc_raw.reserve(pool_size);
-            for (int t = 0; t < pool_size; ++t) {
-                dc_storage[t].reset(storage_distance_computer(storage));
-                dc_raw.push_back(dc_storage[t].get());
-            }
-
             const float* query = x + i * d;
             for (int t = 0; t < pool_size; ++t) {
                 dc_storage[t]->set_query(query);
             }
 
-            if (i == 0) { printf("[PATHWISE-DBG] q0: DCs ready, dc_raw.size()=%zu\n", dc_raw.size()); fflush(stdout); }
             DistanceComputer& dis = *dc_storage[0];
             idx_t* idxi = labels + i * k;
             float* simi = distances + i * k;
             char* filters = filter_id_map + i * ntotal;
 
             maxheap_heapify(k, simi, idxi);
-            if (i == 0) { printf("[PATHWISE-DBG] q0: calling hybrid_search\n"); fflush(stdout); }
             ACORNStats stats = acorn.hybrid_search(
                     dis,
                     k,
@@ -375,7 +375,6 @@ void IndexACORN::search(
                     filters,
                     params,
                     &dc_raw);
-            if (i == 0) { printf("[PATHWISE-DBG] q0: hybrid_search returned\n"); fflush(stdout); }
 
             n1 += stats.n1;
             n2 += stats.n2;
@@ -504,23 +503,25 @@ void IndexACORN::search(
     int default_edgewise_nt = compute_edgewise_threads(params);
 
     int pathwise_nt = params ? params->pathwise_width : acorn.pathwise_width;
-    bool use_intra_query = pathwise_nt >= 2;
+    int omp_threads = omp_get_max_threads();
+    bool use_intra_query = pathwise_nt >= 2 ||
+            (pathwise_nt == 1 && default_edgewise_nt >= 2 && omp_threads <= default_edgewise_nt);
 
     if (use_intra_query) {
-        // === Intra-query parallel mode (iQAN-style pathwise) ===
-        int pool_size = std::min(pathwise_nt, omp_get_max_threads());
+        int pool_size = std::min(
+                pathwise_nt >= 2 ? pathwise_nt : default_edgewise_nt,
+                omp_threads);
+
+        VisitedTable vt(ntotal);
+        std::vector<std::unique_ptr<DistanceComputer>> dc_storage(pool_size);
+        std::vector<DistanceComputer*> dc_raw;
+        dc_raw.reserve(pool_size);
+        for (int t = 0; t < pool_size; ++t) {
+            dc_storage[t].reset(storage_distance_computer(storage));
+            dc_raw.push_back(dc_storage[t].get());
+        }
 
         for (idx_t i = 0; i < n; i++) {
-            VisitedTable vt(ntotal);
-
-            std::vector<std::unique_ptr<DistanceComputer>> dc_storage(pool_size);
-            std::vector<DistanceComputer*> dc_raw;
-            dc_raw.reserve(pool_size);
-            for (int t = 0; t < pool_size; ++t) {
-                dc_storage[t].reset(storage_distance_computer(storage));
-                dc_raw.push_back(dc_storage[t].get());
-            }
-
             const float* query = x + i * d;
             for (int t = 0; t < pool_size; ++t) {
                 dc_storage[t]->set_query(query);

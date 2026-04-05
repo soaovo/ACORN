@@ -69,6 +69,7 @@ int main(int argc, char *argv[]) {
     int iqan_local_queue_capacity = 0;
     int iqan_index_threshold = -1;
     int iqan_seq_iterations = 1;
+    int edgewise_nt = 0; // 0 = auto (omp_get_max_threads)
     // int filter = 0;
     std::string dataset; // must be sift1B or sift1M or tripclick or custom/custom1B
     int test_partitions = 0;
@@ -86,10 +87,10 @@ int main(int argc, char *argv[]) {
     int opt;
     {// parse arguments
 
-        if (argc < 6 || argc > 10) {
+        if (argc < 6 || argc > 11) {
             fprintf(
                     stderr,
-                    "Syntax: %s <number vecs> <gamma> <dataset> <M> <M_beta> [<pathwise_max_width> [<pathwise_growth_interval> [<efSearch> [<reduced_sync>]]]]\n",
+                    "Syntax: %s <N> <gamma> <dataset> <M> <M_beta> [<pathwise_width> [<growth_interval> [<efSearch> [<reduced_sync> [<edgewise_nt>]]]]]\n",
                     argv[0]);
             exit(1);
         }
@@ -140,8 +141,11 @@ int main(int argc, char *argv[]) {
                 exit(1);
             }
         }
-        if (argc == 10) {
+        if (argc >= 10) {
             reduced_sync = atoi(argv[9]) != 0;
+        }
+        if (argc >= 11) {
+            edgewise_nt = atoi(argv[10]);
         }
 
         const char* efs_env = getenv("ACORN_EFSEARCH");
@@ -178,6 +182,7 @@ int main(int argc, char *argv[]) {
         printf("iqan_local_queue_capacity: %d\n", iqan_local_queue_capacity);
         printf("iqan_index_threshold: %d\n", iqan_index_threshold);
         printf("iqan_seq_iterations: %d\n", iqan_seq_iterations);
+        printf("edgewise_nt: %d\n", edgewise_nt);
 
     }
     
@@ -489,6 +494,9 @@ int main(int argc, char *argv[]) {
         search_params.iqan_local_queue_capacity = iqan_local_queue_capacity;
         search_params.iqan_index_threshold = iqan_index_threshold;
         search_params.iqan_seq_iterations = iqan_seq_iterations;
+        if (edgewise_nt > 0) {
+            search_params.edgewise_nt = edgewise_nt;
+        }
 
         double t1_x = elapsed();
         hybrid_index->search(
