@@ -2000,9 +2000,6 @@ int hybrid_search_from_candidates(
         }
 
         // ====== iQAN-style in-place sorted queue implementation ======
-        // Matches iQAN paper: fixed-size pre-allocated arrays, binary
-        // search + memmove insertion, zero heap allocation in hot path.
-
         struct Candidate {
             int id;
             float distance;
@@ -2013,10 +2010,7 @@ int hybrid_search_from_candidates(
             }
         };
 
-        const int L = std::max(k, efSearch); // master queue capacity
-
-        // Pre-allocate all queues in one contiguous array (iQAN layout):
-        // [local_queue_0 | local_queue_1 | ... | local_queue_{W-1} | master_queue]
+        const int L = std::max(k, efSearch);
         const int local_cap = iqan_local_queue_capacity;
         const int total_slots = iqan_workers * local_cap + L;
         std::vector<Candidate> set_L(total_slots);
@@ -2028,7 +2022,7 @@ int hybrid_search_from_candidates(
         const int master_start = iqan_workers * local_cap;
         queue_starts[iqan_workers] = master_start;
 
-        // In-place insert: binary search + memmove, returns insert position
+        // --- add_into_queue: binary search + memmove, returns insert pos ---
         auto add_into_queue = [](std::vector<Candidate>& q, int q_start,
                                  int& q_size, int q_cap,
                                  const Candidate& cand) -> int {
@@ -2042,19 +2036,15 @@ int hybrid_search_from_candidates(
                     q.begin() + q_start + q_size, cand);
             int insert_loc = static_cast<int>(it - (q.begin() + q_start));
             if (insert_loc < q_size) {
-                if (it->id == cand.id) {
-                    return q_cap; // duplicate
-                }
-                if (q_size >= q_cap) {
-                    --q_size;
-                }
+                if (it->id == cand.id) return q_cap; // duplicate
+                if (q_size >= q_cap) --q_size; // full: drop last
             } else {
                 if (q_size < q_cap) {
                     q[q_start + q_size] = cand;
                     ++q_size;
                     return q_size - 1;
                 }
-                return q_cap; // beyond capacity
+                return q_cap; // worse than all, queue full
             }
             int abs_loc = q_start + insert_loc;
             std::memmove(&q[abs_loc + 1], &q[abs_loc],
@@ -2064,57 +2054,54 @@ int hybrid_search_from_candidates(
             return insert_loc;
         };
 
-        // Merge queue2 into queue1 (fixed size), returns lowest insert pos
-        auto merge_into_fixed = [&](std::vector<Candidate>& q,
-                                    int q1_start, int q1_size,
-                                    int q2_start, int& q2_size) -> int {
-            if (q2_size == 0) return q1_size;
-            // Find insert point of first element
+        // --- merge_into_master: merge queue2 into fixed-size master (size=L) ---
+        // Follows iQAN merge_two_queues_into_1st_queue_seq_fixed exactly.
+        auto merge_into_master = [&](int q2_start, int& q2_size) -> int {
+            if (q2_size == 0) return L;
+            const int q1_start = master_start;
+            const int q1_size = L; // master is always full (padded with FLT_MAX)
             auto it = std::lower_bound(
-                    q.begin() + q1_start,
-                    q.begin() + q1_start + q1_size,
-                    q[q2_start]);
-            int insert_idx = static_cast<int>(it - (q.begin() + q1_start));
-            if (insert_idx >= q1_size) {
-                q2_size = 0;
-                return q1_size;
-            }
+                    set_L.begin() + q1_start,
+                    set_L.begin() + q1_start + q1_size,
+                    set_L[q2_start]);
+            int insert_idx = static_cast<int>(it - (set_L.begin() + q1_start));
+            if (insert_idx >= q1_size) { q2_size = 0; return q1_size; }
             // Insert first element
-            if (q[q2_start].id != it->id) {
-                int abs = q1_start + insert_idx;
-                std::memmove(&q[abs + 1], &q[abs],
+            if (set_L[q2_start].id != it->id) {
+                int a = q1_start + insert_idx;
+                std::memmove(&set_L[a + 1], &set_L[a],
                              (q1_size - insert_idx - 1) * sizeof(Candidate));
-                q[abs] = q[q2_start];
+                set_L[a] = set_L[q2_start];
+            } else if (!set_L[q2_start].checked && it->checked) {
+                it->checked = false;
             }
-            // Merge remaining
-            int qi1 = insert_idx + 1 + q1_start;
+            if (q2_size == 1) { q2_size = 0; return insert_idx; }
+            // Merge remaining elements
+            int qi1 = q1_start + insert_idx + 1;
             int qi2 = q2_start + 1;
             int qi1_end = q1_start + q1_size;
             int qi2_end = q2_start + q2_size;
             for (int ins_i = insert_idx + 1; ins_i < q1_size; ++ins_i) {
                 if (qi1 >= qi1_end || qi2 >= qi2_end) break;
-                if (q[qi1] < q[qi2]) {
+                if (set_L[qi1] < set_L[qi2]) {
                     ++qi1;
-                } else if (q[qi2] < q[qi1]) {
-                    int abs = q1_start + ins_i;
-                    std::memmove(&q[abs + 1], &q[abs],
+                } else if (set_L[qi2] < set_L[qi1]) {
+                    int a = q1_start + ins_i;
+                    std::memmove(&set_L[a + 1], &set_L[a],
                                  (q1_size - ins_i - 1) * sizeof(Candidate));
-                    q[abs] = q[qi2++];
+                    set_L[a] = set_L[qi2++];
                     ++qi1;
                 } else {
-                    // duplicate
-                    if (!q[qi2].checked && q[qi1].checked) {
-                        q[qi1].checked = false;
-                    }
-                    ++qi2;
-                    ++qi1;
+                    if (!set_L[qi2].checked && set_L[qi1].checked)
+                        set_L[qi1].checked = false;
+                    ++qi2; ++qi1;
                 }
             }
             q2_size = 0;
             return insert_idx;
         };
 
-        // Initialize master queue from MinimaxHeap candidates
+        // --- Initialize master queue: fill L slots, pad with sentinel ---
         int& master_size = queue_sizes[iqan_workers];
         for (int i = 0; i < candidates.size(); ++i) {
             idx_t id = candidates.ids[i];
@@ -2122,11 +2109,16 @@ int hybrid_search_from_candidates(
             Candidate c{static_cast<int>(id), candidates.dis[i], false};
             add_into_queue(set_L, master_start, master_size, L, c);
         }
+        // Pad remaining slots with sentinel so master is always size L
+        for (int i = master_size; i < L; ++i) {
+            set_L[master_start + i] = {-1, std::numeric_limits<float>::max(), false};
+        }
+        master_size = L;
 
-        // Expand one candidate's neighbors into a queue (in-place)
+        // --- expand_one: expand neighbors in-place, no dist_bound when queue not "real-full" ---
         auto expand_one = [&](DistanceComputer& worker, int v0,
                               int q_start, int& q_size, int q_cap,
-                              const float& dist_bound,
+                              float dist_bound,
                               int& local_ndis) -> int {
             int nk = q_cap;
             size_t begin, end;
@@ -2174,25 +2166,27 @@ int hybrid_search_from_candidates(
             return nk;
         };
 
+        // dist_bound: last REAL element of master queue (skip sentinels)
+        auto get_dist_bound = [&]() -> float {
+            return set_L[master_start + L - 1].distance;
+        };
+
         int k_master = 0;
         auto advance_cursor = [&]() {
-            while (k_master < master_size &&
-                   set_L[master_start + k_master].checked)
+            while (k_master < L && set_L[master_start + k_master].checked)
                 ++k_master;
         };
         auto stopped = [&]() {
             advance_cursor();
-            return k_master >= master_size;
+            return k_master >= L;
         };
 
-        // Pick unchecked candidates from master → worker local queues
         auto pick_to_workers = [&]() -> bool {
             bool assigned = false;
             int dest = 0;
-            for (int idx = k_master; idx < master_size; ++idx) {
+            for (int idx = k_master; idx < L; ++idx) {
                 Candidate& c = set_L[master_start + idx];
-                if (c.checked) continue;
-                // Copy to worker's local queue
+                if (c.checked || c.id < 0) continue;
                 int& ws = queue_sizes[dest];
                 if (ws < local_cap) {
                     set_L[queue_starts[dest] + ws] = c;
@@ -2207,13 +2201,6 @@ int hybrid_search_from_candidates(
             return assigned;
         };
 
-        // Distance bound = last element of master queue
-        auto dist_bound = [&]() -> float {
-            return master_size > 0
-                    ? set_L[master_start + master_size - 1].distance
-                    : std::numeric_limits<float>::max();
-        };
-
         // Sequential start (1 iteration)
         {
             int local_ndis = 0;
@@ -2221,7 +2208,7 @@ int hybrid_search_from_candidates(
                 Candidate& c = set_L[master_start + k_master];
                 c.checked = true;
                 int r = expand_one(qdis, c.id, master_start, master_size,
-                                   L, dist_bound(), local_ndis);
+                                   L, get_dist_bound(), local_ndis);
                 ndis += local_ndis;
                 if (r <= k_master) k_master = r; else ++k_master;
             }
@@ -2234,9 +2221,10 @@ int hybrid_search_from_candidates(
             std::vector<int> local_ndis(iqan_total_threads, 0);
             int next_master = k_master;
             const int X = iqan_seq_iterations;
+            float db = get_dist_bound();
 
 #if defined(_OPENMP)
-#pragma omp parallel num_threads(iqan_total_threads) shared(next_master, local_ndis)
+#pragma omp parallel num_threads(iqan_total_threads) shared(next_master, local_ndis, db)
             {
                 int tid = omp_get_thread_num();
                 int qs = queue_starts[tid];
@@ -2245,11 +2233,10 @@ int hybrid_search_from_candidates(
                 int k_uc = (tid == iqan_workers) ? k_master : 0;
                 DistanceComputer& w = (tid == iqan_workers)
                         ? qdis : *(*dc_pool)[tid + 1];
-                float db = dist_bound();
                 int iters = 0;
                 while (iters < X && k_uc < qsz) {
                     Candidate& c = set_L[qs + k_uc];
-                    if (c.checked) { ++k_uc; continue; }
+                    if (c.checked || c.id < 0) { ++k_uc; continue; }
                     c.checked = true;
                     ++iters;
                     int r = expand_one(w, c.id, qs, qsz, qcap, db,
@@ -2259,12 +2246,10 @@ int hybrid_search_from_candidates(
                 if (tid == iqan_workers) next_master = k_uc;
             }
 #else
-            // Fallback sequential
             for (int wid = 0; wid < iqan_workers; ++wid) {
                 int qs = queue_starts[wid];
                 int& qsz = queue_sizes[wid];
                 DistanceComputer& w = *(*dc_pool)[wid + 1];
-                float db = dist_bound();
                 int k_uc = 0, iters = 0;
                 while (iters < X && k_uc < qsz) {
                     Candidate& c = set_L[qs + k_uc];
@@ -2276,11 +2261,10 @@ int hybrid_search_from_candidates(
                 }
             }
             {
-                float db = dist_bound();
                 int k_uc = k_master, iters = 0;
                 while (iters < X && k_uc < master_size) {
                     Candidate& c = set_L[master_start + k_uc];
-                    if (c.checked) { ++k_uc; continue; }
+                    if (c.checked || c.id < 0) { ++k_uc; continue; }
                     c.checked = true; ++iters;
                     int r = expand_one(qdis, c.id, master_start, master_size,
                                        L, db, local_ndis[iqan_workers]);
@@ -2291,13 +2275,12 @@ int hybrid_search_from_candidates(
 #endif
             for (int v : local_ndis) ndis += v;
 
-            // Merge all worker queues into master
+            // Merge all worker queues into master (master is always size L)
             int best_insert = L;
             for (int wid = 0; wid < iqan_workers; ++wid) {
                 int& ws = queue_sizes[wid];
                 if (ws == 0) continue;
-                int r = merge_into_fixed(set_L, master_start, L,
-                                         queue_starts[wid], ws);
+                int r = merge_into_master(queue_starts[wid], ws);
                 if (r < best_insert) best_insert = r;
             }
 
@@ -2316,8 +2299,9 @@ int hybrid_search_from_candidates(
         }
 
         nres = 0;
-        for (int i = 0; i < master_size; ++i) {
+        for (int i = 0; i < L; ++i) {
             const Candidate& c = set_L[master_start + i];
+            if (c.id < 0) continue; // skip sentinel
             if (!sel || sel->is_member(c.id)) {
                 if (nres < k) {
                     faiss::maxheap_push(++nres, D, I, c.distance, c.id);
