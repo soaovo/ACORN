@@ -341,8 +341,10 @@ void IndexACORN::search(
         fflush(stdout);
 
         for (idx_t i = 0; i < n; i++) {
+            if (i == 0) { printf("[PATHWISE-DBG] q0: creating VisitedTable ntotal=%lld\n", (long long)ntotal); fflush(stdout); }
             VisitedTable vt(ntotal);
 
+            if (i == 0) { printf("[PATHWISE-DBG] q0: creating %d DistanceComputers\n", pool_size); fflush(stdout); }
             std::vector<std::unique_ptr<DistanceComputer>> dc_storage(pool_size);
             std::vector<DistanceComputer*> dc_raw;
             dc_raw.reserve(pool_size);
@@ -356,12 +358,14 @@ void IndexACORN::search(
                 dc_storage[t]->set_query(query);
             }
 
+            if (i == 0) { printf("[PATHWISE-DBG] q0: DCs ready, dc_raw.size()=%zu\n", dc_raw.size()); fflush(stdout); }
             DistanceComputer& dis = *dc_storage[0];
             idx_t* idxi = labels + i * k;
             float* simi = distances + i * k;
             char* filters = filter_id_map + i * ntotal;
 
             maxheap_heapify(k, simi, idxi);
+            if (i == 0) { printf("[PATHWISE-DBG] q0: calling hybrid_search\n"); fflush(stdout); }
             ACORNStats stats = acorn.hybrid_search(
                     dis,
                     k,
@@ -371,6 +375,7 @@ void IndexACORN::search(
                     filters,
                     params,
                     &dc_raw);
+            if (i == 0) { printf("[PATHWISE-DBG] q0: hybrid_search returned\n"); fflush(stdout); }
 
             n1 += stats.n1;
             n2 += stats.n2;

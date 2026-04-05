@@ -2908,6 +2908,8 @@ ACORNStats ACORN::hybrid_search(
         return stats;
     }
 
+    static std::atomic<int> hs_dbg_count{0};
+    int hs_dbg = hs_dbg_count.fetch_add(1);
 
     if (upper_beam == 1) { // common branch
         debug("%s\n", "reached upper beam == 1");
@@ -2934,6 +2936,7 @@ ACORNStats ACORN::hybrid_search(
         //  greedy search on upper levels
         storage_idx_t nearest = entry_point;
         float d_nearest = qdis(nearest);
+        if (hs_dbg < 1) { printf("[PATHWISE-DBG] hybrid_search: entry_point=%d d_nearest=%g max_level=%d dc_pool=%s\n", nearest, d_nearest, max_level, dc_pool ? "non-null" : "NULL"); fflush(stdout); }
 
         debug_search("-starting at ep: %d, d: %f, metadata: %d\n", nearest, d_nearest, metadata[nearest]);
 
@@ -2943,10 +2946,11 @@ ACORNStats ACORN::hybrid_search(
             ndis_upper += hybrid_greedy_update_nearest(*this, qdis, filter_map, level, nearest, d_nearest);
             // ndis_upper += hybrid_greedy_update_nearest(*this, qdis, filter, op, regex, level, nearest, d_nearest);
             debug_search("-at level %d, new nearest: %d, d: %f, metadata: %d\n", level, nearest, d_nearest, metadata[nearest]);
-            
+
 
         }
         stats.n3 += ndis_upper;
+        if (hs_dbg < 1) { printf("[PATHWISE-DBG] hybrid_search: upper levels done, nearest=%d, calling search_from_candidates\n", nearest); fflush(stdout); }
 
         int ef = std::max(efSearch, k);
         if (search_bounded_queue) { // this is the most common branch
