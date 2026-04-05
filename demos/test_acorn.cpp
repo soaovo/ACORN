@@ -479,6 +479,7 @@ int main(int argc, char *argv[]) {
         }
 
         faiss::SearchParametersACORN search_params;
+        search_params.efSearch = efs;
         search_params.pathwise_width = pathwise_width;
         search_params.pathwise_init_width = 1;
         search_params.pathwise_max_width = pathwise_width;
