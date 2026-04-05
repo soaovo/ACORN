@@ -327,66 +327,130 @@ void IndexACORN::search(
 
     int default_edgewise_nt = compute_edgewise_threads(params);
 
-    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
-        idx_t i1 = std::min(i0 + check_period, n);
+    // Determine pathwise width: >= 2 means intra-query parallel (iQAN mode)
+    int pathwise_nt = params ? params->pathwise_width : acorn.pathwise_width;
+    bool use_intra_query = pathwise_nt >= 2;
 
-#pragma omp parallel
-        {
+    if (use_intra_query) {
+        // === Intra-query parallel mode (iQAN-style pathwise) ===
+        // Process queries sequentially, but use multiple threads per query.
+        int pool_size = std::min(pathwise_nt, omp_get_max_threads());
+        printf("[PATHWISE] IndexACORN hybrid_search: intra-query mode "
+               "(pathwise_width=%d, pool_size=%d, n_queries=%lld)\n",
+               pathwise_nt, pool_size, (long long)n);
+        fflush(stdout);
+
+        for (idx_t i = 0; i < n; i++) {
             VisitedTable vt(ntotal);
 
-            int edgewise_nt = default_edgewise_nt;
-            if (omp_in_parallel() && omp_get_num_threads() > 1) {
-                edgewise_nt = 1;
-            }
-            std::vector<std::unique_ptr<DistanceComputer>> dc_storage(edgewise_nt);
+            std::vector<std::unique_ptr<DistanceComputer>> dc_storage(pool_size);
             std::vector<DistanceComputer*> dc_raw;
-            if (edgewise_nt > 1) {
-                dc_raw.reserve(edgewise_nt);
-            }
-            for (int t = 0; t < edgewise_nt; ++t) {
+            dc_raw.reserve(pool_size);
+            for (int t = 0; t < pool_size; ++t) {
                 dc_storage[t].reset(storage_distance_computer(storage));
-                if (edgewise_nt > 1) {
-                    dc_raw.push_back(dc_storage[t].get());
-                }
+                dc_raw.push_back(dc_storage[t].get());
             }
 
-#pragma omp for reduction(+ : n1, n2, n3, ndis, nreorder, candidates_loop, neighbors_loop, tuple_unwrap, skips, visits)
-            for (idx_t i = i0; i < i1; i++) {
-                const float* query = x + i * d;
-                for (int t = 0; t < edgewise_nt; ++t) {
-                    dc_storage[t]->set_query(query);
-                }
+            const float* query = x + i * d;
+            for (int t = 0; t < pool_size; ++t) {
+                dc_storage[t]->set_query(query);
+            }
 
-                DistanceComputer& dis = *dc_storage[0];
-                idx_t* idxi = labels + i * k;
-                float* simi = distances + i * k;
-                char* filters = filter_id_map + i * ntotal;
+            DistanceComputer& dis = *dc_storage[0];
+            idx_t* idxi = labels + i * k;
+            float* simi = distances + i * k;
+            char* filters = filter_id_map + i * ntotal;
 
-                maxheap_heapify(k, simi, idxi);
-                ACORNStats stats = acorn.hybrid_search(
-                        dis,
-                        k,
-                        idxi,
-                        simi,
-                        vt,
-                        filters,
-                        params,
-                        edgewise_nt > 1 ? &dc_raw : nullptr);
+            maxheap_heapify(k, simi, idxi);
+            ACORNStats stats = acorn.hybrid_search(
+                    dis,
+                    k,
+                    idxi,
+                    simi,
+                    vt,
+                    filters,
+                    params,
+                    &dc_raw);
 
-                n1 += stats.n1;
-                n2 += stats.n2;
-                n3 += stats.n3;
-                ndis += stats.ndis;
-                nreorder += stats.nreorder;
-                candidates_loop += stats.candidates_loop;
-                neighbors_loop += stats.neighbors_loop;
-                tuple_unwrap += stats.tuple_unwrap;
-                skips += stats.skips;
-                visits += stats.visits;
-                maxheap_reorder(k, simi, idxi);
+            n1 += stats.n1;
+            n2 += stats.n2;
+            n3 += stats.n3;
+            ndis += stats.ndis;
+            nreorder += stats.nreorder;
+            candidates_loop += stats.candidates_loop;
+            neighbors_loop += stats.neighbors_loop;
+            tuple_unwrap += stats.tuple_unwrap;
+            skips += stats.skips;
+            visits += stats.visits;
+            maxheap_reorder(k, simi, idxi);
+
+            if (InterruptCallback::is_interrupted()) {
+                InterruptCallback::check();
             }
         }
-        InterruptCallback::check();
+    } else {
+        // === Inter-query parallel mode (original) ===
+        for (idx_t i0 = 0; i0 < n; i0 += check_period) {
+            idx_t i1 = std::min(i0 + check_period, n);
+
+#pragma omp parallel
+            {
+                VisitedTable vt(ntotal);
+
+                int edgewise_nt = default_edgewise_nt;
+                if (omp_in_parallel() && omp_get_num_threads() > 1) {
+                    edgewise_nt = 1;
+                }
+                std::vector<std::unique_ptr<DistanceComputer>> dc_storage(edgewise_nt);
+                std::vector<DistanceComputer*> dc_raw;
+                if (edgewise_nt > 1) {
+                    dc_raw.reserve(edgewise_nt);
+                }
+                for (int t = 0; t < edgewise_nt; ++t) {
+                    dc_storage[t].reset(storage_distance_computer(storage));
+                    if (edgewise_nt > 1) {
+                        dc_raw.push_back(dc_storage[t].get());
+                    }
+                }
+
+#pragma omp for reduction(+ : n1, n2, n3, ndis, nreorder, candidates_loop, neighbors_loop, tuple_unwrap, skips, visits)
+                for (idx_t i = i0; i < i1; i++) {
+                    const float* query = x + i * d;
+                    for (int t = 0; t < edgewise_nt; ++t) {
+                        dc_storage[t]->set_query(query);
+                    }
+
+                    DistanceComputer& dis = *dc_storage[0];
+                    idx_t* idxi = labels + i * k;
+                    float* simi = distances + i * k;
+                    char* filters = filter_id_map + i * ntotal;
+
+                    maxheap_heapify(k, simi, idxi);
+                    ACORNStats stats = acorn.hybrid_search(
+                            dis,
+                            k,
+                            idxi,
+                            simi,
+                            vt,
+                            filters,
+                            params,
+                            edgewise_nt > 1 ? &dc_raw : nullptr);
+
+                    n1 += stats.n1;
+                    n2 += stats.n2;
+                    n3 += stats.n3;
+                    ndis += stats.ndis;
+                    nreorder += stats.nreorder;
+                    candidates_loop += stats.candidates_loop;
+                    neighbors_loop += stats.neighbors_loop;
+                    tuple_unwrap += stats.tuple_unwrap;
+                    skips += stats.skips;
+                    visits += stats.visits;
+                    maxheap_reorder(k, simi, idxi);
+                }
+            }
+            InterruptCallback::check();
+        }
     }
 
     if (metric_type == METRIC_INNER_PRODUCT) {
@@ -434,59 +498,109 @@ void IndexACORN::search(
 
     int default_edgewise_nt = compute_edgewise_threads(params);
 
-    for (idx_t i0 = 0; i0 < n; i0 += check_period) {
-        idx_t i1 = std::min(i0 + check_period, n);
+    int pathwise_nt = params ? params->pathwise_width : acorn.pathwise_width;
+    bool use_intra_query = pathwise_nt >= 2;
 
-#pragma omp parallel
-        {
+    if (use_intra_query) {
+        // === Intra-query parallel mode (iQAN-style pathwise) ===
+        int pool_size = std::min(pathwise_nt, omp_get_max_threads());
+
+        for (idx_t i = 0; i < n; i++) {
             VisitedTable vt(ntotal);
 
-            int edgewise_nt = default_edgewise_nt;
-            if (omp_in_parallel() && omp_get_num_threads() > 1) {
-                edgewise_nt = 1;
-            }
-            std::vector<std::unique_ptr<DistanceComputer>> dc_storage(edgewise_nt);
+            std::vector<std::unique_ptr<DistanceComputer>> dc_storage(pool_size);
             std::vector<DistanceComputer*> dc_raw;
-            if (edgewise_nt > 1) {
-                dc_raw.reserve(edgewise_nt);
-            }
-
-            for (int t = 0; t < edgewise_nt; ++t) {
+            dc_raw.reserve(pool_size);
+            for (int t = 0; t < pool_size; ++t) {
                 dc_storage[t].reset(storage_distance_computer(storage));
-                if (edgewise_nt > 1) {
-                    dc_raw.push_back(dc_storage[t].get());
-                }
+                dc_raw.push_back(dc_storage[t].get());
             }
 
-#pragma omp for reduction(+ : n1, n2, n3, ndis, nreorder)
-            for (idx_t i = i0; i < i1; i++) {
-                const float* query = x + i * d;
-                for (int t = 0; t < edgewise_nt; ++t) {
-                    dc_storage[t]->set_query(query);
-                }
+            const float* query = x + i * d;
+            for (int t = 0; t < pool_size; ++t) {
+                dc_storage[t]->set_query(query);
+            }
 
-                DistanceComputer& dis = *dc_storage[0];
-                idx_t* idxi = labels + i * k;
-                float* simi = distances + i * k;
+            DistanceComputer& dis = *dc_storage[0];
+            idx_t* idxi = labels + i * k;
+            float* simi = distances + i * k;
 
-                maxheap_heapify(k, simi, idxi);
-                ACORNStats stats = acorn.search(
-                        dis,
-                        k,
-                        idxi,
-                        simi,
-                        vt,
-                        params,
-                        edgewise_nt > 1 ? &dc_raw : nullptr);
-                n1 += stats.n1;
-                n2 += stats.n2;
-                n3 += stats.n3;
-                ndis += stats.ndis;
-                nreorder += stats.nreorder;
-                maxheap_reorder(k, simi, idxi);
+            maxheap_heapify(k, simi, idxi);
+            ACORNStats stats = acorn.search(
+                    dis,
+                    k,
+                    idxi,
+                    simi,
+                    vt,
+                    params,
+                    &dc_raw);
+            n1 += stats.n1;
+            n2 += stats.n2;
+            n3 += stats.n3;
+            ndis += stats.ndis;
+            nreorder += stats.nreorder;
+            maxheap_reorder(k, simi, idxi);
+
+            if (InterruptCallback::is_interrupted()) {
+                InterruptCallback::check();
             }
         }
-        InterruptCallback::check();
+    } else {
+        // === Inter-query parallel mode (original) ===
+        for (idx_t i0 = 0; i0 < n; i0 += check_period) {
+            idx_t i1 = std::min(i0 + check_period, n);
+
+#pragma omp parallel
+            {
+                VisitedTable vt(ntotal);
+
+                int edgewise_nt = default_edgewise_nt;
+                if (omp_in_parallel() && omp_get_num_threads() > 1) {
+                    edgewise_nt = 1;
+                }
+                std::vector<std::unique_ptr<DistanceComputer>> dc_storage(edgewise_nt);
+                std::vector<DistanceComputer*> dc_raw;
+                if (edgewise_nt > 1) {
+                    dc_raw.reserve(edgewise_nt);
+                }
+
+                for (int t = 0; t < edgewise_nt; ++t) {
+                    dc_storage[t].reset(storage_distance_computer(storage));
+                    if (edgewise_nt > 1) {
+                        dc_raw.push_back(dc_storage[t].get());
+                    }
+                }
+
+#pragma omp for reduction(+ : n1, n2, n3, ndis, nreorder)
+                for (idx_t i = i0; i < i1; i++) {
+                    const float* query = x + i * d;
+                    for (int t = 0; t < edgewise_nt; ++t) {
+                        dc_storage[t]->set_query(query);
+                    }
+
+                    DistanceComputer& dis = *dc_storage[0];
+                    idx_t* idxi = labels + i * k;
+                    float* simi = distances + i * k;
+
+                    maxheap_heapify(k, simi, idxi);
+                    ACORNStats stats = acorn.search(
+                            dis,
+                            k,
+                            idxi,
+                            simi,
+                            vt,
+                            params,
+                            edgewise_nt > 1 ? &dc_raw : nullptr);
+                    n1 += stats.n1;
+                    n2 += stats.n2;
+                    n3 += stats.n3;
+                    ndis += stats.ndis;
+                    nreorder += stats.nreorder;
+                    maxheap_reorder(k, simi, idxi);
+                }
+            }
+            InterruptCallback::check();
+        }
     }
 
     if (metric_type == METRIC_INNER_PRODUCT) {

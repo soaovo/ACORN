@@ -28,6 +28,7 @@
 #include <unordered_set>
 #include <iostream>
 #include <fstream>
+#define _OPENMP 1
 /*******************************************************
  * Added for debugging
  *******************************************************/
@@ -1392,16 +1393,6 @@ int search_from_candidates(
     int iqan_seq_iterations = params ? params->iqan_seq_iterations : 1;
     iqan_seq_iterations = std::max(1, iqan_seq_iterations);
 
-    auto update_results = [&](int id, float distance) {
-        if (!sel || sel->is_member(id)) {
-            if (nres < k) {
-                faiss::maxheap_push(++nres, D, I, distance, id);
-            } else if (distance < D[0]) {
-                faiss::maxheap_replace_top(nres, D, I, distance, id);
-            }
-        }
-    };
-
     if (level == 0 && iqan_total_threads >= 2) {
         struct IQANCandidate {
             int id;
@@ -1461,8 +1452,7 @@ int search_from_candidates(
         auto merge_sorted_into_queue =
                 [&](std::vector<IQANCandidate>& queue,
                     int capacity,
-                    std::vector<IQANCandidate>& incoming,
-                    bool update_topk) {
+                    std::vector<IQANCandidate>& incoming) {
                     if (incoming.empty()) {
                         return capacity;
                     }
@@ -1503,11 +1493,6 @@ int search_from_candidates(
                         }
 
                         if (take_incoming) {
-                            if (update_topk) {
-                                update_results(
-                                        incoming[in_idx].id,
-                                        incoming[in_idx].distance);
-                            }
                             best_insert = std::min<int>(
                                     best_insert,
                                     static_cast<int>(merged.size()));
@@ -1526,8 +1511,7 @@ int search_from_candidates(
                     return merge_sorted_into_queue(
                             master_queue,
                             master_queue_capacity,
-                            local_queue,
-                            true);
+                            local_queue);
                 };
 
         auto expand_candidate_into_queue =
@@ -1535,8 +1519,7 @@ int search_from_candidates(
                     int v0,
                     std::vector<IQANCandidate>& queue,
                     int queue_capacity,
-                    int& local_ndis,
-                    bool update_topk) {
+                    int& local_ndis) {
                     std::vector<IQANCandidate> discovered;
                     size_t begin, end;
                     hnsw.neighbor_range(v0, level, &begin, &end);
@@ -1552,8 +1535,7 @@ int search_from_candidates(
                         float distance = worker(v1);
                         discovered.push_back({v1, distance, false});
                     }
-                    return merge_sorted_into_queue(
-                            queue, queue_capacity, discovered, update_topk);
+                    return merge_sorted_into_queue(queue, queue_capacity, discovered);
                 };
 
         size_t k_master = 0;
@@ -1565,8 +1547,7 @@ int search_from_candidates(
 
         auto should_stop_iqan = [&]() {
             advance_master_cursor();
-            return k_master >= master_queue.size() ||
-                    (do_dis_check && k_master >= (size_t)efSearch);
+            return k_master >= master_queue.size();
         };
 
         DistanceComputer* master_worker = &qdis;
@@ -1594,8 +1575,9 @@ int search_from_candidates(
             return assigned;
         };
 
+        const int seq_iter_bound = 1;
         int seq_iter = 0;
-        while (seq_iter < iqan_seq_iterations && !should_stop_iqan()) {
+        while (seq_iter < seq_iter_bound && !should_stop_iqan()) {
             IQANCandidate& candidate = master_queue[k_master];
             candidate.checked = true;
             int local_ndis = 0;
@@ -1604,8 +1586,7 @@ int search_from_candidates(
                     candidate.id,
                     master_queue,
                     master_queue_capacity,
-                    local_ndis,
-                    true);
+                    local_ndis);
             ndis += local_ndis;
             if (insert_index <= (int)k_master) {
                 k_master = insert_index;
@@ -1622,7 +1603,7 @@ int search_from_candidates(
 
             std::vector<int> local_ndis(iqan_total_threads, 0);
             size_t next_master = k_master;
-            const int subsearch_iterations = 1;
+            const int subsearch_iterations = iqan_seq_iterations;
 
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(iqan_total_threads) shared(next_master, local_ndis)
@@ -1645,8 +1626,7 @@ int search_from_candidates(
                                 candidate.id,
                                 master_queue,
                                 master_queue_capacity,
-                                local_ndis[tid],
-                                true);
+                                local_ndis[tid]);
                         if (insert_index <= (int)k_local) {
                             k_local = static_cast<size_t>(std::max(0, insert_index));
                         } else {
@@ -1673,8 +1653,7 @@ int search_from_candidates(
                                 candidate.id,
                                 local_queue,
                                 iqan_local_queue_capacity,
-                                local_ndis[tid],
-                                false);
+                                local_ndis[tid]);
                         if (insert_index <= (int)k_local) {
                             k_local = static_cast<size_t>(std::max(0, insert_index));
                         } else {
@@ -1703,8 +1682,7 @@ int search_from_candidates(
                             candidate.id,
                             local_queue,
                             iqan_local_queue_capacity,
-                            local_ndis[worker_id],
-                            false);
+                            local_ndis[worker_id]);
                     if (insert_index <= (int)k_local) {
                         k_local = static_cast<size_t>(std::max(0, insert_index));
                     } else {
@@ -1729,8 +1707,7 @@ int search_from_candidates(
                             candidate.id,
                             master_queue,
                             master_queue_capacity,
-                            local_ndis[iqan_workers],
-                            true);
+                            local_ndis[iqan_workers]);
                     if (insert_index <= (int)k_local) {
                         k_local = static_cast<size_t>(std::max(0, insert_index));
                     } else {
@@ -1768,6 +1745,20 @@ int search_from_candidates(
                 stats.n2++;
             }
             stats.n3 += ndis;
+        }
+
+        nres = 0;
+        for (const IQANCandidate& candidate : master_queue) {
+            if (!sel || sel->is_member(candidate.id)) {
+                if (nres < k) {
+                    faiss::maxheap_push(++nres, D, I, candidate.distance, candidate.id);
+                } else if (candidate.distance < D[0]) {
+                    faiss::maxheap_replace_top(nres, D, I, candidate.distance, candidate.id);
+                }
+                if (nres >= k) {
+                    break;
+                }
+            }
         }
 
         return nres;
@@ -1996,17 +1987,16 @@ int hybrid_search_from_candidates(
     int iqan_seq_iterations = params ? params->iqan_seq_iterations : 1;
     iqan_seq_iterations = std::max(1, iqan_seq_iterations);
 
-    auto update_results = [&](int id, float distance) {
-        if (!sel || sel->is_member(id)) {
-            if (nres < k) {
-                faiss::maxheap_push(++nres, D, I, distance, id);
-            } else if (distance < D[0]) {
-                faiss::maxheap_replace_top(nres, D, I, distance, id);
-            }
-        }
-    };
-
     if (level == 0 && iqan_total_threads >= 2) {
+        static std::atomic<int> iqan_entry_count{0};
+        int entry_id = iqan_entry_count.fetch_add(1);
+        if (entry_id < 3) {
+            printf("[PATHWISE] hybrid_search_from_candidates: ENTERED iQAN path "
+                   "(threads=%d, workers=%d, efSearch=%d, seq_iters=%d)\n",
+                   iqan_total_threads, iqan_workers, efSearch, iqan_seq_iterations);
+            fflush(stdout);
+        }
+
         struct IQANCandidate {
             int id;
             float distance;
@@ -2065,8 +2055,7 @@ int hybrid_search_from_candidates(
         auto merge_sorted_into_queue =
                 [&](std::vector<IQANCandidate>& queue,
                     int capacity,
-                    std::vector<IQANCandidate>& incoming,
-                    bool update_topk) {
+                    std::vector<IQANCandidate>& incoming) {
                     if (incoming.empty()) {
                         return capacity;
                     }
@@ -2107,11 +2096,6 @@ int hybrid_search_from_candidates(
                         }
 
                         if (take_incoming) {
-                            if (update_topk) {
-                                update_results(
-                                        incoming[in_idx].id,
-                                        incoming[in_idx].distance);
-                            }
                             best_insert = std::min<int>(
                                     best_insert,
                                     static_cast<int>(merged.size()));
@@ -2130,8 +2114,7 @@ int hybrid_search_from_candidates(
                     return merge_sorted_into_queue(
                             master_queue,
                             master_queue_capacity,
-                            local_queue,
-                            true);
+                            local_queue);
                 };
 
         auto expand_candidate_into_queue =
@@ -2139,8 +2122,7 @@ int hybrid_search_from_candidates(
                     int v0,
                     std::vector<IQANCandidate>& queue,
                     int queue_capacity,
-                    int& local_ndis,
-                    bool update_topk) {
+                    int& local_ndis) {
                     std::vector<IQANCandidate> discovered;
                     size_t begin, end;
                     hnsw.neighbor_range(v0, level, &begin, &end);
@@ -2192,8 +2174,7 @@ int hybrid_search_from_candidates(
                         }
                     }
 
-                    return merge_sorted_into_queue(
-                            queue, queue_capacity, discovered, update_topk);
+                    return merge_sorted_into_queue(queue, queue_capacity, discovered);
                 };
 
         size_t k_master = 0;
@@ -2205,8 +2186,7 @@ int hybrid_search_from_candidates(
 
         auto should_stop_iqan = [&]() {
             advance_master_cursor();
-            return k_master >= master_queue.size() ||
-                    (do_dis_check && k_master >= (size_t)efSearch);
+            return k_master >= master_queue.size();
         };
 
         DistanceComputer* master_worker = &qdis;
@@ -2234,8 +2214,9 @@ int hybrid_search_from_candidates(
             return assigned;
         };
 
+        const int seq_iter_bound = 1;
         int seq_iter = 0;
-        while (seq_iter < iqan_seq_iterations && !should_stop_iqan()) {
+        while (seq_iter < seq_iter_bound && !should_stop_iqan()) {
             IQANCandidate& candidate = master_queue[k_master];
             candidate.checked = true;
             int local_ndis = 0;
@@ -2244,8 +2225,7 @@ int hybrid_search_from_candidates(
                     candidate.id,
                     master_queue,
                     master_queue_capacity,
-                    local_ndis,
-                    true);
+                    local_ndis);
             ndis += local_ndis;
             if (insert_index <= (int)k_master) {
                 k_master = std::max(0, insert_index);
@@ -2262,7 +2242,7 @@ int hybrid_search_from_candidates(
 
             std::vector<int> local_ndis(iqan_total_threads, 0);
             size_t next_master = k_master;
-            const int subsearch_iterations = 1;
+            const int subsearch_iterations = iqan_seq_iterations;
 
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(iqan_total_threads) shared(next_master, local_ndis)
@@ -2285,8 +2265,7 @@ int hybrid_search_from_candidates(
                                 candidate.id,
                                 master_queue,
                                 master_queue_capacity,
-                                local_ndis[tid],
-                                true);
+                                local_ndis[tid]);
                         if (insert_index <= (int)k_local) {
                             k_local = static_cast<size_t>(std::max(0, insert_index));
                         } else {
@@ -2313,8 +2292,7 @@ int hybrid_search_from_candidates(
                                 candidate.id,
                                 local_queue,
                                 iqan_local_queue_capacity,
-                                local_ndis[tid],
-                                false);
+                                local_ndis[tid]);
                         if (insert_index <= (int)k_local) {
                             k_local = static_cast<size_t>(std::max(0, insert_index));
                         } else {
@@ -2343,8 +2321,7 @@ int hybrid_search_from_candidates(
                             candidate.id,
                             local_queue,
                             iqan_local_queue_capacity,
-                            local_ndis[worker_id],
-                            false);
+                            local_ndis[worker_id]);
                     if (insert_index <= (int)k_local) {
                         k_local = static_cast<size_t>(std::max(0, insert_index));
                     } else {
@@ -2369,8 +2346,7 @@ int hybrid_search_from_candidates(
                             candidate.id,
                             master_queue,
                             master_queue_capacity,
-                            local_ndis[iqan_workers],
-                            true);
+                            local_ndis[iqan_workers]);
                     if (insert_index <= (int)k_local) {
                         k_local = static_cast<size_t>(std::max(0, insert_index));
                     } else {
@@ -2410,7 +2386,34 @@ int hybrid_search_from_candidates(
             stats.n3 += ndis;
         }
 
+        nres = 0;
+        for (const IQANCandidate& candidate : master_queue) {
+            if (!sel || sel->is_member(candidate.id)) {
+                if (nres < k) {
+                    faiss::maxheap_push(++nres, D, I, candidate.distance, candidate.id);
+                } else if (candidate.distance < D[0]) {
+                    faiss::maxheap_replace_top(nres, D, I, candidate.distance, candidate.id);
+                }
+                if (nres >= k) {
+                    break;
+                }
+            }
+        }
+
         return nres;
+    }
+
+    {
+        static std::atomic<int> fallback_count{0};
+        int fb_id = fallback_count.fetch_add(1);
+        if (fb_id < 3) {
+            printf("[PATHWISE] hybrid_search_from_candidates: FALLBACK to frontier loop "
+                   "(level=%d, iqan_threads=%d, reduced_sync=%d, dc_pool=%s, pathwise_width=%d)\n",
+                   level, iqan_total_threads, reduced_sync ? 1 : 0,
+                   dc_pool ? "non-null" : "NULL",
+                   pathwise.fixed_width);
+            fflush(stdout);
+        }
     }
 
     auto merge_frontier_round = [&](const std::vector<FrontierExpansion>& frontier) {
