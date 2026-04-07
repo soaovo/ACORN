@@ -437,10 +437,10 @@ int main(int argc, char *argv[]) {
 
         printf("[%.3f s] *** Query time: %f\n",
                elapsed() - t0, t2 - t1);
-        
-        // print number of distance computations
-        // printf("[%.3f s] *** Number of distance computations: %ld\n",
-            //    elapsed() - t0, base_index.ntotal * nq);
+
+        float base_recall = compute_recall(gt, gt_size, nns, nq, k);
+        printf("HNSW Recall@%d: %.4f\n", k, base_recall);
+
         std::cout << "finished base index examples" << std::endl;
 
     }
@@ -530,9 +530,10 @@ int main(int argc, char *argv[]) {
         printf("[%.3f s] *** Query time: %f\n",
                elapsed() - t0, t2_x - t1_x);
 
+        float acorn_recall = compute_recall(gt, gt_size, nns2, nq, k, gamma);
+        printf("ACORN Recall@%d: %.4f\n", k, acorn_recall);
 
-
-         std::cout << "finished hybrid index examples" << std::endl;
+        std::cout << "finished hybrid index examples" << std::endl;
     }
 
 
