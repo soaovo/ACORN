@@ -347,7 +347,7 @@ float compute_recall(std::vector<faiss::idx_t>& gt, int gt_size, std::vector<fai
     for (int i = 0; i < nq; i++) { // loop over all queries
         // int gt_nn = gt[i * k];
         std::vector<faiss::idx_t>::const_iterator first = gt.begin() + i*gt_size;
-        std::vector<faiss::idx_t>::const_iterator last = gt.begin() + i*gt_size + (k / gamma);
+        std::vector<faiss::idx_t>::const_iterator last = gt.begin() + i*gt_size + std::max(1, k / gamma);
         std::vector<faiss::idx_t> gt_nns_tmp(first, last);
         // if (gt_nns_tmp.size() > 10) {
         //     printf("gt_nns size: %ld\n", gt_nns_tmp.size());
