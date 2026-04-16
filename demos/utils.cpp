@@ -339,45 +339,27 @@ std::pair<float, float> get_mean_and_std(std::vector<float>& times) {
 
 
 
-// ground truth labels @gt, results to evaluate @I with @nq queries, returns @gt_size-Recall@k where gt had max gt_size NN's per query
-float compute_recall(std::vector<faiss::idx_t>& gt, int gt_size, std::vector<faiss::idx_t>& I, int nq, int k, int gamma=1) {
-    // printf("compute_recall params: gt.size(): %ld, gt_size: %d, I.size(): %ld, nq: %d, k: %d, gamma: %d\n", gt.size(), gt_size, I.size(), nq, k, gamma);
-    
+// ground truth labels @gt, results to evaluate @I with @nq queries, returns Recall@k where gt had max gt_size NN's per query
+float compute_recall(std::vector<faiss::idx_t>& gt, int gt_size, std::vector<faiss::idx_t>& I, int nq, int k) {
     int n_1 = 0, n_10 = 0, n_100 = 0;
-    for (int i = 0; i < nq; i++) { // loop over all queries
-        // int gt_nn = gt[i * k];
-        std::vector<faiss::idx_t>::const_iterator first = gt.begin() + i*gt_size;
-        std::vector<faiss::idx_t>::const_iterator last = gt.begin() + i*gt_size + std::max(1, k / gamma);
-        std::vector<faiss::idx_t> gt_nns_tmp(first, last);
-        // if (gt_nns_tmp.size() > 10) {
-        //     printf("gt_nns size: %ld\n", gt_nns_tmp.size());
-        // }
-        
-        // gt_nns_tmp.resize(k); // truncate if gt_size > k
-        std::set<faiss::idx_t> gt_nns(gt_nns_tmp.begin(), gt_nns_tmp.end());
-        // if (gt_nns.size() > 10) {
-        //     printf("gt_nns size: %ld\n", gt_nns.size());
-        // }
-        
-        
-        for (int j = 0; j < k; j++) { // iterate over returned nn results
-            if (gt_nns.count(I[i * k + j])!=0) {
-            // if (I[i * k + j] == gt_nn) {
-                if (j < 1 * gamma)
+    for (int i = 0; i < nq; i++) {
+        int gt_count = std::min(k, gt_size);
+        std::vector<faiss::idx_t>::const_iterator first = gt.begin() + i * gt_size;
+        std::vector<faiss::idx_t>::const_iterator last = first + gt_count;
+        std::set<faiss::idx_t> gt_nns(first, last);
+        gt_nns.erase(-1); // remove sentinel entries
+
+        for (int j = 0; j < k; j++) {
+            if (gt_nns.count(I[i * k + j]) != 0) {
+                if (j < 1)
                     n_1++;
-                if (j < 10 * gamma)
+                if (j < 10)
                     n_10++;
-                if (j < 100 * gamma)
+                if (j < 100)
                     n_100++;
             }
         }
     }
-    // BASE ACCURACY
-    // printf("* Base HNSW accuracy relative to exact search:\n");
-    // printf("\tR@1 = %.4f\n", n_1 / float(nq) );
-    // printf("\tR@10 = %.4f\n", n_10 / float(nq));
-    // printf("\tR@100 = %.4f\n", n_100 / float(nq)); // not sure why this is always same as R@10
-    // printf("\t---Results for %ld queries, k=%d, N=%ld, gt_size=%d\n", nq, k, N, gt_size);
     return (n_10 / float(nq));
 
 }

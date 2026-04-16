@@ -37,6 +37,7 @@
 #include <thread>
 #include <set>
 #include <math.h>  
+#include <algorithm> // for std::partial_sort
 #include <numeric> // for std::accumulate
 #include <cmath>   // for std::mean and std::stdev
 #include <nlohmann/json.hpp>
@@ -232,6 +233,44 @@ int main(int argc, char *argv[]) {
     { // load ground truth
         gt = load_gt(dataset, gamma, alpha, assignment_type, N);
         printf("[%.3f s] Loaded ground truth, gt_size: %d\n", elapsed() - t0, gt_size);
+    }
+
+    // Compute filtered ground truth for ACORN recall evaluation
+    // The standard GT is unfiltered (all vectors), but ACORN returns only
+    // vectors matching the query predicate, so we need filtered GT.
+    std::vector<faiss::idx_t> filtered_gt(k * nq);
+    {
+        printf("[%.3f s] Computing filtered ground truth (brute force)...\n", elapsed() - t0);
+        size_t nb_gt, d2_gt;
+        bool is_base_gt = 1;
+        std::string filename_gt = get_file_name(dataset, is_base_gt);
+        float* xb_gt = fvecs_read_n(filename_gt.c_str(), &d2_gt, &nb_gt, N);
+
+        for (size_t i = 0; i < nq; i++) {
+            std::vector<std::pair<float, faiss::idx_t>> candidates;
+            for (size_t j = 0; j < (size_t)N; j++) {
+                if (metadata[j] == aq[i]) {
+                    float dist = 0;
+                    for (size_t dim = 0; dim < (size_t)d; dim++) {
+                        float diff = xq[i * d + dim] - xb_gt[j * d + dim];
+                        dist += diff * diff;
+                    }
+                    candidates.push_back({dist, (faiss::idx_t)j});
+                }
+            }
+            int n_results = std::min((int)candidates.size(), k);
+            if (n_results > 0) {
+                std::partial_sort(candidates.begin(), candidates.begin() + n_results, candidates.end());
+            }
+            for (int j = 0; j < n_results; j++) {
+                filtered_gt[i * k + j] = candidates[j].second;
+            }
+            for (int j = n_results; j < k; j++) {
+                filtered_gt[i * k + j] = -1;
+            }
+        }
+        delete[] xb_gt;
+        printf("[%.3f s] Filtered ground truth computed\n", elapsed() - t0);
     }
 
     auto path_exists = [](const std::string& path) {
@@ -530,7 +569,7 @@ int main(int argc, char *argv[]) {
         printf("[%.3f s] *** Query time: %f\n",
                elapsed() - t0, t2_x - t1_x);
 
-        float acorn_recall = compute_recall(gt, gt_size, nns2, nq, k, gamma);
+        float acorn_recall = compute_recall(filtered_gt, k, nns2, nq, k);
         printf("ACORN Recall@%d: %.4f\n", k, acorn_recall);
 
         std::cout << "finished hybrid index examples" << std::endl;
